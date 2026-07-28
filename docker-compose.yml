@@ -1,0 +1,44 @@
+# Local development only.
+#
+# `db` here stands in for the agent's own store (conversations, audit,
+# registry). It is NOT a stand-in for OriginBI's database — reads go to a real
+# Neon read replica, because the write-assertion guard needs a connection that
+# genuinely cannot write. Point NEON_REPLICA_URL at a real replica.
+#
+# If you must develop entirely offline, set DB_ALLOW_WRITABLE_READ_POOL=true to
+# disable the guard and point NEON_REPLICA_URL at a scratch database. Never do
+# this in a deployed environment; `validateConfig` refuses it in production.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ori
+      POSTGRES_PASSWORD: ori
+      POSTGRES_DB: ori_agent
+    ports:
+      - '5433:5432'
+    volumes:
+      - ori-agent-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ori -d ori_agent']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  service:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      PORT: 3200
+      NODE_ENV: development
+      REGISTRY_DB_URL: postgres://ori:ori@db:5432/ori_agent
+    ports:
+      - '3200:3200'
+
+volumes:
+  ori-agent-db:

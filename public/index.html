@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ori Agent — Console</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>◈</text></svg>" />
+<link rel="stylesheet" href="/admin/styles.css" />
+</head>
+<body>
+
+<div id="login" class="login">
+  <form class="login-card" id="login-form">
+    <div class="brand"><span class="mark">◈</span> Ori Agent</div>
+    <p class="muted">Sign in to the operator console.</p>
+    <label>Email<input type="email" id="login-email" autocomplete="username" required /></label>
+    <label>Password<input type="password" id="login-password" autocomplete="current-password" required /></label>
+    <button type="submit" class="primary">Sign in</button>
+    <p class="error" id="login-error" hidden></p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header class="topbar">
+    <div class="brand"><span class="mark">◈</span> Ori Agent</div>
+    <select id="app-select" class="app-select" title="Application"></select>
+    <div class="spacer"></div>
+    <span class="muted" id="whoami"></span>
+    <button id="logout" class="ghost">Sign out</button>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button data-view="overview" class="active">Activity</button>
+    <button data-view="functions">Functions</button>
+    <button data-view="roles">Roles</button>
+    <button data-view="models">Models</button>
+    <button data-view="applications">Applications</button>
+    <button data-view="conversations">Conversations</button>
+    <button data-view="audit">Audit</button>
+  </nav>
+
+  <main id="main"></main>
+</div>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-card">
+    <header>
+      <h2 id="modal-title">Edit</h2>
+      <button class="ghost" id="modal-close">✕</button>
+    </header>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="/admin/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,58 @@
+{
+  "$comment": "Plan-correctness eval. Each case is a question, the role asking it, and the function the planner should choose (null = no data call). This file is per-deployment: replace these examples with questions your own users actually ask, one batch per function. Run against a real model; CI uses a stub so builds stay deterministic. Track the score as functions are added — a drop usually means two descriptions have grown too similar.",
+
+  "$howToUse": [
+    "1. Add 5-10 questions per live function, in the words your users use.",
+    "2. Include boundary cases: pairs of questions that differ only in which function is right.",
+    "3. Include negatives (expect: null) — small talk, and things you do not support.",
+    "4. Re-run after every batch of new functions."
+  ],
+
+  "cases": [
+    {
+      "$comment": "── Examples. Replace with your own. ──",
+      "question": "what's the status of order ORD-10023",
+      "expect": "get_order",
+      "role": "support"
+    },
+    { "question": "find the order for jane@example.com", "expect": "get_order", "role": "support" },
+    { "question": "look up order 10023", "expect": "get_order", "role": "support" },
+
+    { "question": "list open orders for this month", "expect": "list_orders", "role": "support" },
+    { "question": "how many orders are still unshipped", "expect": "list_orders", "role": "support" },
+    { "question": "show me the next 50 orders", "expect": "list_orders", "role": "support" },
+
+    {
+      "$comment": "Boundary pair — one order versus many. This is where confusable descriptions show up first.",
+      "question": "is order ORD-10023 shipped",
+      "expect": "get_order",
+      "role": "support"
+    },
+    { "question": "which orders shipped yesterday", "expect": "list_orders", "role": "support" },
+
+    {
+      "$comment": "Write. The planner should choose the action, not the lookup, when the user is asking for a change.",
+      "question": "cancel order 10023",
+      "expect": "cancel_order",
+      "role": "manager"
+    },
+
+    {
+      "$comment": "Role boundary — the same question from a role that may not call the function should produce no plan.",
+      "question": "cancel order 10023",
+      "expect": null,
+      "role": "support"
+    },
+
+    {
+      "$comment": "── Negatives. Every eval set needs these. ──",
+      "question": "hello",
+      "expect": null,
+      "role": "support"
+    },
+    { "question": "what can you do", "expect": null, "role": "support" },
+    { "question": "thanks!", "expect": null, "role": "support" },
+    { "question": "what's the weather tomorrow", "expect": null, "role": "support" },
+    { "question": "write me a poem about logistics", "expect": null, "role": "support" }
+  ]
+}
