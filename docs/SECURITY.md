@@ -15,7 +15,7 @@ connection runs them.**
 |---|---|---|
 | 1 | The LLM never generates SQL | No code path passes model output to the driver. The planner's entire vocabulary is the function catalogue. |
 | 2 | No value ever reaches query text | The template language has no syntax that produces one. `test/security/sql-template.spec.ts` and `test/security/no-sql-interpolation.spec.ts`. |
-| 3 | Registry functions run on a connection that cannot write | `ReadDb.assertCannotWrite` proves it at boot and refuses to start otherwise. |
+| 3 | Registry functions run on a connection that cannot write | `ReadDb.runWriteAssertion` asks Postgres for the role's actual write privileges, and the pool is only created if it holds none. |
 | 4 | Writes go through the host application's API | The read connection is the only database path. Actions are HTTP calls to registered services. |
 | 5 | Every call is scoped to the real end user | `compileSqlTemplate` binds the caller's scope values and throws rather than emitting an open filter. |
 | 6 | Every call is audit-logged | `ExecutorService` audits every path, including refusals and validation failures. |
@@ -82,6 +82,77 @@ rejected by the server rather than by a keyword list. The parser is the
 authority, which is the whole point.
 
 `SELECT *` is banned outright, so there is no redaction step to bypass.
+
+---
+
+## The write assertion
+
+`runWriteAssertion` runs before the read pool is created. It does two things, in
+order:
+
+1. If `pg_is_in_recovery()` is true the server is a standby and cannot accept a
+   write at all — that is the strongest form of the guarantee, and it passes.
+2. Otherwise it asks whether the role holds `INSERT`, `UPDATE`, `DELETE` or
+   `TRUNCATE` on any table outside the system schemas, using
+   `has_table_privilege`. Any hit means the pool is never created, and the
+   tables are named in the log and on the console's Database page.
+
+`has_table_privilege` is the right question because it resolves role
+inheritance and grants made to `PUBLIC`, which is exactly where an unintended
+privilege hides.
+
+Two things it deliberately does **not** do:
+
+- **It does not try `CREATE TEMP TABLE`.** Postgres grants `TEMP` on a database
+  to `PUBLIC` by default, so a correctly configured read-only role creates temp
+  tables happily. That probe would reject every valid deployment while proving
+  nothing about user data. This was an early implementation and it was wrong.
+- **It does not trust `default_transaction_read_only`.** That is a session
+  default and any client can undo it with `SET TRANSACTION READ WRITE`. Useful
+  as a seatbelt, worthless as a guarantee.
+
+Holding `CREATE` on a schema is reported as a warning rather than a refusal: it
+cannot alter existing data, but a read-only role has no business with it.
+
+### Refusing the pool, not the process
+
+A failed assertion used to call `process.exit(1)`. It now refuses to open the
+pool instead. That is not a weakening, and the distinction is worth being
+precise about:
+
+- **What is unchanged:** no registry function can execute either way. Every path
+  to the read connection goes through `requirePool()`, which throws with the
+  reason. There is no code path that reaches the driver without it.
+- **What is better:** the console comes up and says *which tables* the role can
+  write and how to fix it. A process in a crash loop tells nobody anything, and
+  on a first deployment it is the operator who most needs telling.
+
+The one configuration that still stops the process is
+`DB_ALLOW_WRITABLE_READ_POOL=true` in production — an operator explicitly
+disabling the guard where there is real data to lose.
+
+---
+
+## The setup endpoints
+
+`/admin/api/setup` answers without authentication, because before the first
+operator account exists there is nobody to authenticate. What each route can do
+is bounded rather than trusted:
+
+| Route | What it can do |
+|---|---|
+| `GET /setup` | Report stage names, the agent's own table names, and the DDL that creates them. All public knowledge. |
+| `POST /setup/check` | Reconnect and report again. Floored to one call every two seconds, because it tears down and rebuilds two pools. |
+| `POST /setup/admin` | Create the first account. A single conditional `INSERT … WHERE NOT EXISTS` refuses the moment one exists, so two concurrent submissions cannot both win. |
+
+The one genuinely sensitive field is the raw driver message, which can name a
+host, a port or a user. It is attached **only while no operator account
+exists** — exactly the window in which there is nothing yet to protect. After
+that the same detail is one sign-in away on the Database page.
+
+Note that the account guard depends on the database being reachable. If it is
+not, the conditional insert fails and no account can be created — the endpoint
+cannot be used to seize a deployment whose database has gone away.
 
 ---
 
@@ -214,10 +285,12 @@ Also enforced (`test/security/http-action.spec.ts`):
 
 ## The console
 
-Served from a fixed three-entry map rather than a resolved path, so directory
-traversal is not something it can do. `X-Frame-Options: DENY` and a CSP of
-`default-src 'none'` with `'self'` for script, style and connect — it loads
-nothing from anywhere else, which also means it works when the network does not.
+Served from a fixed map of filenames rather than a path resolved from the
+request, so directory traversal is not something it can do. `X-Frame-Options:
+DENY` and a CSP of `default-src 'none'` with `'self'` for script, style and
+connect — it loads nothing from anywhere else, which also means it works when
+the network does not. There is no inline script: the theme bootstrap is its own
+file precisely so the CSP needs no hash to keep in sync.
 
 Local accounts rather than SSO, deliberately: the console is most useful when
 something is broken, and that is exactly when a dependency on another system
@@ -234,7 +307,9 @@ Before merging anything that touches data access or authentication:
       you added one, justify it in review — the alternative is binding the value.
 - [ ] No new path constructs a `RequestContext` outside `ApiKeyGuard`.
 - [ ] No new code path reaches the read connection except through
-      `SqlFunctionRunner`.
+      `SqlFunctionRunner`, and none bypasses `ReadDb.requirePool()`.
+- [ ] Nothing new was added to the unauthenticated setup response. Anything that
+      names a host, a user or a credential belongs behind a session.
 - [ ] Any new outbound HTTP resolves through the service registry.
 - [ ] New engine queries use explicit column lists.
 - [ ] Scope handling still throws rather than defaulting to open.
