@@ -3,7 +3,6 @@ import {
   type MiddlewareConsumer,
   type NestModule,
 } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
 import { LoggerModule } from 'nestjs-pino';
 import { randomUUID } from 'node:crypto';
 import { AdminModule } from './admin/admin.module';
@@ -14,20 +13,22 @@ import {
   MIDDLEWARE_ROUTE_PATTERN,
   RequestIdMiddleware,
 } from './common/request-id.middleware';
-import { CONFIG, loadConfiguration, validateConfig } from './config/configuration';
+import { OriConfigModule } from './config/config.module';
+import { loadConfiguration } from './config/configuration';
 import { DbModule } from './db/db.module';
 import { LlmModule } from './llm/llm.module';
 import { ManagementModule } from './management/management.module';
 import { MemoryModule } from './memory/memory.module';
 import { OrchestratorModule } from './orchestrator/orchestrator.module';
 import { RegistryModule } from './registry/registry.module';
+import { SetupModule } from './setup/setup.module';
 import { MaintenanceService } from './common/maintenance.service';
 
 const config = loadConfiguration();
 
 @Module({
   imports: [
-    ConfigModule.forRoot({ isGlobal: true, cache: true }),
+    OriConfigModule,
     LoggerModule.forRoot({
       pinoHttp: {
         level: config.service.logLevel,
@@ -68,19 +69,10 @@ const config = loadConfiguration();
     OrchestratorModule,
     ManagementModule,
     AdminModule,
+    SetupModule,
   ],
   controllers: [HealthController],
-  providers: [
-    {
-      provide: CONFIG,
-      useFactory: () => {
-        validateConfig(config);
-        return config;
-      },
-    },
-    MaintenanceService,
-  ],
-  exports: [CONFIG],
+  providers: [MaintenanceService],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer): void {
