@@ -85,7 +85,7 @@ export class RegistryService {
 
     const rows = await this.db.query<FunctionRow>(
       `SELECT ${SELECT_COLUMNS}
-         FROM ${this.schema}.functions
+         FROM ${this.schema}.agent_functions
         WHERE application_id = $1 AND status = 'live'
         ORDER BY name`,
       [applicationId],
@@ -141,7 +141,7 @@ export class RegistryService {
   ): Promise<FunctionDefinition | null> {
     const row = await this.db.one<FunctionRow>(
       `SELECT ${SELECT_COLUMNS}
-         FROM ${this.schema}.functions
+         FROM ${this.schema}.agent_functions
         WHERE application_id = $1 AND name = $2`,
       [applicationId, name],
     );
@@ -150,7 +150,7 @@ export class RegistryService {
 
   async getById(id: number): Promise<FunctionDefinition | null> {
     const row = await this.db.one<FunctionRow>(
-      `SELECT ${SELECT_COLUMNS} FROM ${this.schema}.functions WHERE id = $1`,
+      `SELECT ${SELECT_COLUMNS} FROM ${this.schema}.agent_functions WHERE id = $1`,
       [id],
     );
     return row ? toDefinition(row) : null;
@@ -162,9 +162,9 @@ export class RegistryService {
   ): Promise<FunctionDefinition[]> {
     const rows = await this.db.query<FunctionRow>(
       status
-        ? `SELECT ${SELECT_COLUMNS} FROM ${this.schema}.functions
+        ? `SELECT ${SELECT_COLUMNS} FROM ${this.schema}.agent_functions
             WHERE application_id = $1 AND status = $2 ORDER BY name`
-        : `SELECT ${SELECT_COLUMNS} FROM ${this.schema}.functions
+        : `SELECT ${SELECT_COLUMNS} FROM ${this.schema}.agent_functions
             WHERE application_id = $1 ORDER BY name`,
       status ? [applicationId, status] : [applicationId],
     );
@@ -196,7 +196,7 @@ export class RegistryService {
     threshold = 0.6,
   ): Promise<Array<{ name: string; similarity: number }>> {
     const rows = await this.db.query<{ name: string; description: string }>(
-      `SELECT name, description FROM ${this.schema}.functions
+      `SELECT name, description FROM ${this.schema}.agent_functions
         WHERE application_id = $1 AND ($2::text IS NULL OR name <> $2)`,
       [applicationId, excludeName ?? null],
     );

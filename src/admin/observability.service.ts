@@ -74,8 +74,8 @@ export class ObservabilityService {
     }>(
       `SELECT r.run_key, a.slug, r.end_user_id, r.end_user_role,
               r.intent, r.streamed, r.started_at
-         FROM ${this.schema}.runs r
-         JOIN ${this.schema}.applications a ON a.id = r.application_id
+         FROM ${this.schema}.agent_runs r
+         JOIN ${this.schema}.agent_applications a ON a.id = r.application_id
         WHERE r.status = 'running'
         ORDER BY r.started_at DESC
         LIMIT 100`,
@@ -112,8 +112,8 @@ export class ObservabilityService {
       `SELECT r.run_key, a.slug, r.end_user_id, r.end_user_role, r.intent,
               r.status, r.response_type, r.functions_used, r.streamed,
               r.latency_ms, r.error, r.started_at
-         FROM ${this.schema}.runs r
-         JOIN ${this.schema}.applications a ON a.id = r.application_id
+         FROM ${this.schema}.agent_runs r
+         JOIN ${this.schema}.agent_applications a ON a.id = r.application_id
         ORDER BY r.started_at DESC
         LIMIT $1`,
       [Math.min(limit, 200)],
@@ -156,14 +156,14 @@ export class ObservabilityService {
            percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::text         AS p95,
            COUNT(*) FILTER (WHERE response_type = 'clarification'
                               AND started_at > now() - interval '24 hours')::text AS clarifications
-         FROM ${this.schema}.runs
+         FROM ${this.schema}.agent_runs
         WHERE started_at > now() - interval '24 hours' OR status = 'running'`,
       ),
       this.db.query<{ name: string; calls: string; errors: string }>(
         `SELECT function_name AS name,
                 COUNT(*)::text AS calls,
                 COUNT(*) FILTER (WHERE status IN ('error','denied'))::text AS errors
-           FROM ${this.schema}.audit_log
+           FROM ${this.schema}.agent_audit_log
           WHERE created_at > now() - interval '24 hours'
           GROUP BY function_name
           ORDER BY COUNT(*) DESC
@@ -172,7 +172,7 @@ export class ObservabilityService {
     ]);
 
     const denied = await this.db.one<{ count: string }>(
-      `SELECT COUNT(*)::text AS count FROM ${this.schema}.audit_log
+      `SELECT COUNT(*)::text AS count FROM ${this.schema}.agent_audit_log
         WHERE status = 'denied' AND created_at > now() - interval '24 hours'`,
     );
 
@@ -207,13 +207,13 @@ export class ObservabilityService {
     return this.db.query(
       functionName
         ? `SELECT ${AUDIT_COLUMNS}
-             FROM ${this.schema}.audit_log l
-             JOIN ${this.schema}.applications a ON a.id = l.application_id
+             FROM ${this.schema}.agent_audit_log l
+             JOIN ${this.schema}.agent_applications a ON a.id = l.application_id
             WHERE l.function_name = $2
             ORDER BY l.created_at DESC LIMIT $1`
         : `SELECT ${AUDIT_COLUMNS}
-             FROM ${this.schema}.audit_log l
-             JOIN ${this.schema}.applications a ON a.id = l.application_id
+             FROM ${this.schema}.agent_audit_log l
+             JOIN ${this.schema}.agent_applications a ON a.id = l.application_id
             ORDER BY l.created_at DESC LIMIT $1`,
       functionName
         ? [Math.min(limit, 500), functionName]
@@ -232,8 +232,8 @@ export class ObservabilityService {
                 r.intent, r.status, r.response_type, r.functions_used,
                 r.streamed, r.error, r.latency_ms, r.started_at, r.completed_at,
                 a.slug AS application_slug
-           FROM ${this.schema}.runs r
-           JOIN ${this.schema}.applications a ON a.id = r.application_id
+           FROM ${this.schema}.agent_runs r
+           JOIN ${this.schema}.agent_applications a ON a.id = r.application_id
           WHERE r.run_key = $1`,
         [runKey],
       ),
@@ -242,7 +242,7 @@ export class ObservabilityService {
                 scopes_applied, status, denied_reason, error_message,
                 disambiguated, disambiguation_resolution, row_count,
                 latency_ms, created_at
-           FROM ${this.schema}.audit_log
+           FROM ${this.schema}.agent_audit_log
           WHERE run_key = $1 ORDER BY created_at`,
         [runKey],
       ),
@@ -259,7 +259,7 @@ export class ObservabilityService {
    */
   async reapStaleRuns(timeoutMs: number): Promise<number> {
     const rows = await this.db.query<{ run_key: string }>(
-      `UPDATE ${this.schema}.runs
+      `UPDATE ${this.schema}.agent_runs
           SET status = 'failed',
               error = 'Abandoned: no completion recorded before the run timeout',
               completed_at = now()

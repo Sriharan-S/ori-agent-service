@@ -91,7 +91,7 @@ export class AuditLoggerService {
 
     try {
       await this.db.query(
-        `INSERT INTO ${quoteIdent(this.db.schema)}.audit_log (
+        `INSERT INTO ${quoteIdent(this.db.schema)}.agent_audit_log (
            application_id, run_key, conversation_key, end_user_id, end_user_role,
            function_name, function_version, function_kind,
            params, scopes_applied, status, denied_reason, error_message,

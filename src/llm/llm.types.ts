@@ -39,8 +39,14 @@ export class LlmError extends Error {
     readonly provider: string,
     readonly status: number | null = null,
     readonly retryable = false,
+    /**
+     * The underlying failure. Node's fetch reports every transport problem as
+     * "fetch failed" and puts the real one here, so dropping it makes a DNS
+     * typo and a dead port indistinguishable.
+     */
+    cause?: unknown,
   ) {
-    super(message);
+    super(message, cause === undefined ? undefined : { cause });
     this.name = 'LlmError';
   }
 }

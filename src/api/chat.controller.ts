@@ -7,6 +7,14 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import type { Response } from 'express';
+import {
+  ApiExtraModels,
+  ApiHeader,
+  ApiOperation,
+  ApiResponse,
+  ApiSecurity,
+  ApiTags,
+} from '@nestjs/swagger';
 import { ApiKeyGuard, Ctx, RequireScope } from '../auth/api-key.guard';
 import { RateLimitGuard } from '../auth/rate-limit.guard';
 import type { RequestContext } from '../auth/identity';
@@ -21,6 +29,21 @@ import { ChatRequestDto, type ChatResponseDto } from './dto/chat.dto';
  * `POST /v1/chat/stream` emits it as Server-Sent Events. The pipeline is
  * identical — the streaming route passes a sink, the other passes nothing.
  */
+@ApiTags('chat')
+@ApiSecurity('api-key')
+@ApiHeader({
+  name: 'X-End-User',
+  required: false,
+  description:
+    'JSON identity, for applications in `asserted` mode. ' +
+    'e.g. {"id":"4821","role":"support","scopes":{"org_id":42}}',
+})
+@ApiHeader({
+  name: 'X-End-User-Token',
+  required: false,
+  description: "The end user's JWT, for applications in `jwt` mode.",
+})
+@ApiExtraModels(ChatRequestDto)
 @Controller('v1/chat')
 @UseGuards(ApiKeyGuard, RateLimitGuard)
 @RequireScope('chat')
@@ -30,6 +53,15 @@ export class ChatController {
   constructor(private readonly orchestrator: OrchestratorService) {}
 
   @Post()
+  @ApiOperation({
+    summary: 'Ask a question',
+    description:
+      'Runs the full pipeline and returns the finished response. Use the ' +
+      'streaming variant when you want the answer to appear as it is written.',
+  })
+  @ApiResponse({ status: 201, description: 'The agent answered, asked for clarification, or confirmed an action.' })
+  @ApiResponse({ status: 401, description: 'Missing or invalid API key, or unresolvable end user.' })
+  @ApiResponse({ status: 429, description: 'Rate limit exceeded for this end user.' })
   async chat(
     @Body() body: ChatRequestDto,
     @Ctx() context: RequestContext,
@@ -59,6 +91,22 @@ export class ChatController {
    * their own.
    */
   @Post('stream')
+  @ApiOperation({
+    summary: 'Ask a question, streamed',
+    description: [
+      'Server-Sent Events, one JSON event per frame with `event:` naming the type.',
+      '',
+      '**User channel** (always sent): `run.started`, `message.delta`,',
+      '`clarification`, `run.completed`, `error`.',
+      '',
+      '**Trace channel** (only when the key holds the `trace` scope *and* the',
+      'request sets `trace: true`): `router.decision`, `catalogue.selected`,',
+      '`plan.created`, `function.started`, `function.completed`, `reflection`.',
+      'These name functions and echo extracted parameters, so an end-user',
+      'surface should use a key without that scope.',
+    ].join('\n'),
+  })
+  @ApiResponse({ status: 200, description: 'text/event-stream' })
   async stream(
     @Body() body: ChatRequestDto,
     @Ctx() context: RequestContext,

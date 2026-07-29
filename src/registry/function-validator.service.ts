@@ -270,8 +270,13 @@ export class FunctionValidatorService {
   }
 
   /**
-   * Ask Postgres. Compiles with NULL bound to every placeholder — enough to
-   * parse, resolve every identifier and plan, without depending on real values.
+   * Ask Postgres.
+   *
+   * Bound values are type-appropriate placeholders rather than NULL. That
+   * matters more than it looks: with every parameter NULL, a `WHERE a = $1 OR
+   * b = $2` collapses to a provable false and Postgres returns a `One-Time
+   * Filter: false` plan without touching an index — so the plan shown to the
+   * author would say nothing about whether the query is actually index-backed.
    */
   private async checkAgainstDatabase(
     draft: FunctionDraft,
@@ -283,10 +288,10 @@ export class FunctionValidatorService {
     try {
       compiled = compileSqlTemplate({
         template,
-        params: {},
+        params: sampleParams(draft.parameters),
         scopeFilters: draft.scopeFilters,
         scopeValues: Object.fromEntries(
-          draft.scopeFilters.map((filter) => [filter.key, 0]),
+          draft.scopeFilters.map((filter) => [filter.key, 1]),
         ),
         unscopedKeys: [],
       });
@@ -366,6 +371,34 @@ export class FunctionValidatorService {
 
     return { issues, columns, ...(plan ? { plan } : {}) };
   }
+}
+
+/**
+ * Representative values for planning, derived from the declared schema.
+ *
+ * The values are never read — nothing is returned, because the probe runs with
+ * `LIMIT 0`. They exist so Postgres plans the query it would really run: a
+ * number where a number is expected, so an integer comparison is not coerced
+ * into something unindexable, and a short string where a string is expected.
+ */
+function sampleParams(schema: ParamSchema): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+
+  for (const [name, param] of Object.entries(schema)) {
+    switch (param.type) {
+      case 'integer':
+      case 'number':
+        params[name] = param.min ?? 1;
+        break;
+      case 'boolean':
+        params[name] = true;
+        break;
+      default:
+        params[name] = param.enum?.[0] ?? 'sample';
+    }
+  }
+
+  return params;
 }
 
 function collectTemplateNames(text: string): string[] {

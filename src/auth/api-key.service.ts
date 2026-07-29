@@ -65,7 +65,7 @@ export class ApiKeyService {
     const secret = `${prefix}.${randomBytes(SECRET_BYTES).toString('base64url')}`;
 
     const row = await this.db.one<{ id: string }>(
-      `INSERT INTO ${this.schema}.api_keys (application_id, name, prefix, key_hash, scopes)
+      `INSERT INTO ${this.schema}.agent_api_keys (application_id, name, prefix, key_hash, scopes)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING id`,
       [applicationId, name, prefix, hashSecret(secret), scopes],
@@ -116,8 +116,8 @@ export class ApiKeyService {
               a.jwt_issuer, a.jwt_jwks_url, a.jwt_audience,
               a.jwt_subject_claim, a.jwt_role_claim, a.jwt_scope_claims,
               a.is_active AS app_is_active
-         FROM ${this.schema}.api_keys k
-         JOIN ${this.schema}.applications a ON a.id = k.application_id
+         FROM ${this.schema}.agent_api_keys k
+         JOIN ${this.schema}.agent_applications a ON a.id = k.application_id
         WHERE k.prefix = $1
         LIMIT 1`,
       [prefix],
@@ -168,7 +168,7 @@ export class ApiKeyService {
     // Fire and forget: last-used is for the dashboard, not for correctness.
     void this.db
       .query(
-        `UPDATE ${this.schema}.api_keys SET last_used_at = now() WHERE id = $1`,
+        `UPDATE ${this.schema}.agent_api_keys SET last_used_at = now() WHERE id = $1`,
         [key.id],
       )
       .catch(() => undefined);
@@ -178,7 +178,7 @@ export class ApiKeyService {
 
   async revoke(id: number): Promise<void> {
     await this.db.query(
-      `UPDATE ${this.schema}.api_keys SET revoked_at = now() WHERE id = $1`,
+      `UPDATE ${this.schema}.agent_api_keys SET revoked_at = now() WHERE id = $1`,
       [id],
     );
     this.cache.clear();
@@ -197,7 +197,7 @@ export class ApiKeyService {
       revoked_at: Date | null;
     }>(
       `SELECT id, application_id, name, prefix, scopes, last_used_at, revoked_at
-         FROM ${this.schema}.api_keys
+         FROM ${this.schema}.agent_api_keys
         WHERE application_id = $1
         ORDER BY created_at DESC`,
       [applicationId],

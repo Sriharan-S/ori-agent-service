@@ -9,6 +9,7 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { ApiOperation, ApiSecurity, ApiTags } from '@nestjs/swagger';
 import { Ctx, ManagementKeyGuard } from '../auth/api-key.guard';
 import type { RequestContext } from '../auth/identity';
 import { RoleService } from '../auth/role.service';
@@ -29,6 +30,8 @@ import {
  * functions even if it guesses a name, because the application id comes from
  * the key rather than from the request.
  */
+@ApiTags('management')
+@ApiSecurity('api-key')
 @Controller('v1/manage')
 @UseGuards(ManagementKeyGuard)
 export class ManagementController {
@@ -43,6 +46,7 @@ export class ManagementController {
   // ── Functions ──────────────────────────────────────────────────────────────
 
   @Get('functions')
+  @ApiOperation({ summary: 'List functions, optionally filtered by status' })
   async listFunctions(
     @Ctx() context: RequestContext,
     @Query('status') status?: FunctionStatus,
@@ -55,6 +59,7 @@ export class ManagementController {
   }
 
   @Get('functions/:name')
+  @ApiOperation({ summary: 'Fetch one function, including drafts' })
   async getFunction(
     @Ctx() context: RequestContext,
     @Param('name') name: string,
@@ -68,6 +73,7 @@ export class ManagementController {
 
   /** Validate without saving — what a function editor calls as you type. */
   @Post('functions/check')
+  @ApiOperation({ summary: 'Validate a function without saving it' })
   async checkFunction(
     @Ctx() context: RequestContext,
     @Body() body: FunctionInput,
@@ -76,6 +82,7 @@ export class ManagementController {
   }
 
   @Post('functions')
+  @ApiOperation({ summary: 'Create a function (always starts as a draft)' })
   async createFunction(
     @Ctx() context: RequestContext,
     @Body() body: FunctionInput,
@@ -84,6 +91,7 @@ export class ManagementController {
   }
 
   @Put('functions/:name')
+  @ApiOperation({ summary: 'Update a function (returns it to draft)' })
   async updateFunction(
     @Ctx() context: RequestContext,
     @Param('name') name: string,
@@ -97,6 +105,7 @@ export class ManagementController {
    * path; `disabled` is the kill switch and can be set from anywhere.
    */
   @Post('functions/:name/status')
+  @ApiOperation({ summary: 'Promote or retire a function' })
   async setStatus(
     @Ctx() context: RequestContext,
     @Param('name') name: string,
@@ -112,6 +121,7 @@ export class ManagementController {
   }
 
   @Get('functions/:name/versions')
+  @ApiOperation({ summary: 'Version history' })
   async versions(
     @Ctx() context: RequestContext,
     @Param('name') name: string,
@@ -125,6 +135,7 @@ export class ManagementController {
   }
 
   @Delete('functions/:name')
+  @ApiOperation({ summary: 'Delete a function' })
   async deleteFunction(
     @Ctx() context: RequestContext,
     @Param('name') name: string,
@@ -136,11 +147,13 @@ export class ManagementController {
   // ── Roles ──────────────────────────────────────────────────────────────────
 
   @Get('roles')
+  @ApiOperation({ summary: 'List roles' })
   async listRoles(@Ctx() context: RequestContext) {
     return { roles: await this.roles.list(context.application.id) };
   }
 
   @Put('roles/:name')
+  @ApiOperation({ summary: 'Create or update a role' })
   async upsertRole(
     @Ctx() context: RequestContext,
     @Param('name') name: string,
@@ -163,6 +176,7 @@ export class ManagementController {
   }
 
   @Delete('roles/:name')
+  @ApiOperation({ summary: 'Delete a role' })
   async deleteRole(
     @Ctx() context: RequestContext,
     @Param('name') name: string,
@@ -174,11 +188,13 @@ export class ManagementController {
   // ── Services (HTTP action targets) ─────────────────────────────────────────
 
   @Get('services')
+  @ApiOperation({ summary: 'List registered HTTP action targets' })
   async listServices(@Ctx() context: RequestContext) {
     return { services: await this.applications.listServices(context.application.id) };
   }
 
   @Put('services/:name')
+  @ApiOperation({ summary: 'Register an HTTP action target' })
   async upsertService(
     @Ctx() context: RequestContext,
     @Param('name') name: string,
@@ -193,6 +209,7 @@ export class ManagementController {
   }
 
   @Delete('services/:name')
+  @ApiOperation({ summary: 'Remove an HTTP action target' })
   async deleteService(
     @Ctx() context: RequestContext,
     @Param('name') name: string,
@@ -204,6 +221,7 @@ export class ManagementController {
   // ── Conversations ──────────────────────────────────────────────────────────
 
   @Get('conversations')
+  @ApiOperation({ summary: 'List conversations' })
   async listConversations(
     @Ctx() context: RequestContext,
     @Query('limit') limit?: string,
@@ -219,6 +237,7 @@ export class ManagementController {
   }
 
   @Get('conversations/:key')
+  @ApiOperation({ summary: 'Fetch a conversation transcript' })
   async transcript(@Param('key') key: string) {
     return { messages: await this.conversations.getTranscript(key) };
   }

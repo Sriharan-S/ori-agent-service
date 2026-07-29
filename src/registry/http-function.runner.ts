@@ -217,7 +217,7 @@ export class HttpFunctionRunner {
     if (cached && cached.expiresAt > Date.now()) return cached.entries;
 
     const rows = await this.db.query<ServiceRow>(
-      `SELECT name, base_url FROM ${quoteIdent(this.db.schema)}.services
+      `SELECT name, base_url FROM ${quoteIdent(this.db.schema)}.agent_services
         WHERE application_id = $1`,
       [applicationId],
     );

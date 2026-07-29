@@ -186,7 +186,16 @@ export class LlmService {
     );
   }
 
-  /** Reachability probe for `/ready` and the dashboard. */
+  /**
+   * Reachability probe for the dashboard.
+   *
+   * Uses the model's own timeout rather than a fixed budget. A hardcoded 5s was
+   * stricter than both the connection test (15s) and real chat calls (30s), so
+   * an endpoint that answers in, say, 5.5s failed here and nowhere else — and
+   * because this is what writes `last_error`, the console showed a red failure
+   * against a model that works. Health has to be measured against the same
+   * deadline production uses, or it is not measuring health.
+   */
   async healthCheck(
     applicationId: number,
   ): Promise<Array<{ model: string; ok: boolean; error?: string }>> {
@@ -197,7 +206,11 @@ export class LlmService {
         try {
           await new OpenAiCompatibleProvider(model).complete(
             [{ role: 'user', content: 'ping' }],
-            { context: 'healthcheck', maxTokens: 1, timeoutMs: 5000 },
+            {
+              context: 'healthcheck',
+              maxTokens: 1,
+              timeoutMs: model.timeoutMs,
+            },
           );
           await this.models.recordOutcome(model.id, null);
           return { model: model.name, ok: true };

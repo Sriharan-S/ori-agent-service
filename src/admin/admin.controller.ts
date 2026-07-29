@@ -31,6 +31,10 @@ import {
   FunctionManagementService,
   type FunctionInput,
 } from '../management/function-management.service';
+import {
+  FunctionTrialService,
+  type TrialInput,
+} from '../management/function-trial.service';
 import { AdminAuthService, type AdminRole } from './admin-auth.service';
 import {
   ADMIN_SESSION_COOKIE,
@@ -40,6 +44,8 @@ import {
   readCookie,
 } from './admin-session.guard';
 import { ObservabilityService } from './observability.service';
+import { DatabaseInfoService } from './database-info.service';
+import { DEMO_FUNCTION_NAME } from '../management/demo-function';
 
 /**
  * The dashboard's own API.
@@ -55,9 +61,11 @@ export class AdminController {
     @Inject(CONFIG) private readonly config: AppConfig,
     private readonly auth: AdminAuthService,
     private readonly observability: ObservabilityService,
+    private readonly database: DatabaseInfoService,
     private readonly applications: ApplicationService,
     private readonly registry: RegistryService,
     private readonly functions: FunctionManagementService,
+    private readonly trials: FunctionTrialService,
     private readonly roles: RoleService,
     private readonly models: ModelRegistryService,
     private readonly llm: LlmService,
@@ -145,6 +153,21 @@ export class AdminController {
     };
   }
 
+  // ── Database ───────────────────────────────────────────────────────────────
+
+  /** Connection details, the write-assertion result, and what the agent can see. */
+  @Get('database')
+  @UseGuards(AdminSessionGuard)
+  async databaseReport() {
+    return this.database.report();
+  }
+
+  @Get('database/tables')
+  @UseGuards(AdminSessionGuard)
+  async agentTables() {
+    return { tables: await this.database.agentTableNames() };
+  }
+
   // ── Applications ───────────────────────────────────────────────────────────
 
   @Get('applications')
@@ -153,11 +176,38 @@ export class AdminController {
     return { applications: await this.applications.list() };
   }
 
+  /**
+   * Creating an application also installs the demo function, so a new tenant is
+   * immediately testable rather than starting with an empty registry and no way
+   * to tell whether any of it works.
+   */
   @Post('applications')
   @UseGuards(AdminSessionGuard)
   @RequireAdminRole('admin')
   async createApplication(@Body() body: ApplicationInput) {
-    return { application: await this.applications.upsert(body) };
+    const application = await this.applications.upsert(body);
+
+    const demo = await this.functions
+      .ensureDemoFunction(application.id, this.config.db.schema)
+      .catch(() => null);
+
+    return { application, demoInstalled: demo !== null };
+  }
+
+  /** Reinstalls the demo function if it was deleted. */
+  @Post('applications/:id/functions/demo')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async installDemo(@Param('id', ParseIntPipe) id: number) {
+    const result = await this.functions.ensureDemoFunction(
+      id,
+      this.config.db.schema,
+    );
+    return {
+      installed: result !== null,
+      name: DEMO_FUNCTION_NAME,
+      validation: result?.validation ?? null,
+    };
   }
 
   @Put('applications/:id')
@@ -254,6 +304,24 @@ export class AdminController {
     @Body() body: FunctionInput,
   ) {
     return this.functions.check(id, body);
+  }
+
+  /**
+   * Run a function as a chosen role, without promoting it.
+   *
+   * Works on drafts — checking what a function returns before it goes live is
+   * the point — and applies scoping exactly as production does, so refusals can
+   * be tested too.
+   */
+  @Post('applications/:id/functions/:name/try')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async tryFunction(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('name') name: string,
+    @Body() body: TrialInput,
+  ) {
+    return this.trials.run(id, name, body);
   }
 
   @Post('applications/:id/functions')
@@ -380,6 +448,26 @@ export class AdminController {
   async deleteModel(@Param('id', ParseIntPipe) id: number) {
     await this.models.remove(id);
     return { deleted: true };
+  }
+
+  /**
+   * Probe an endpoint before committing it. Accepts unsaved values so a bad
+   * base URL or model id is caught in the editor rather than by the first real
+   * chat request.
+   */
+  @Post('models/test')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async testModel(
+    @Body()
+    body: {
+      baseUrl: string;
+      modelId: string;
+      apiKey?: string | null;
+      existingId?: number | null;
+    },
+  ) {
+    return this.models.testConnection(body);
   }
 
   /** On-demand reachability probe. Not run on the readiness path. */

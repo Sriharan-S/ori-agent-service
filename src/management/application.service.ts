@@ -56,7 +56,7 @@ export class ApplicationService {
     const rows = await this.db.query<ApplicationRow>(
       `SELECT id, slug, name, description, end_user_auth, jwt_issuer, jwt_jwks_url,
               jwt_audience, jwt_subject_claim, jwt_role_claim, jwt_scope_claims, is_active
-         FROM ${this.schema}.applications
+         FROM ${this.schema}.agent_applications
         ORDER BY name`,
     );
     return rows.map(toApplication);
@@ -66,7 +66,7 @@ export class ApplicationService {
     const row = await this.db.one<ApplicationRow>(
       `SELECT id, slug, name, description, end_user_auth, jwt_issuer, jwt_jwks_url,
               jwt_audience, jwt_subject_claim, jwt_role_claim, jwt_scope_claims, is_active
-         FROM ${this.schema}.applications WHERE id = $1`,
+         FROM ${this.schema}.agent_applications WHERE id = $1`,
       [id],
     );
     if (!row) throw new NotFoundException('No such application');
@@ -93,7 +93,7 @@ export class ApplicationService {
 
     const row = id
       ? await this.db.one<ApplicationRow>(
-          `UPDATE ${this.schema}.applications
+          `UPDATE ${this.schema}.agent_applications
               SET slug = $1, name = $2, description = $3, end_user_auth = $4,
                   jwt_issuer = $5, jwt_jwks_url = $6, jwt_audience = $7,
                   jwt_subject_claim = $8, jwt_role_claim = $9,
@@ -104,7 +104,7 @@ export class ApplicationService {
           [...values, id],
         )
       : await this.db.one<ApplicationRow>(
-          `INSERT INTO ${this.schema}.applications
+          `INSERT INTO ${this.schema}.agent_applications
              (slug, name, description, end_user_auth, jwt_issuer, jwt_jwks_url,
               jwt_audience, jwt_subject_claim, jwt_role_claim, jwt_scope_claims, is_active)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11)
@@ -124,7 +124,7 @@ export class ApplicationService {
       name: string;
       base_url: string;
     }>(
-      `SELECT id, name, base_url FROM ${this.schema}.services
+      `SELECT id, name, base_url FROM ${this.schema}.agent_services
         WHERE application_id = $1 ORDER BY name`,
       [applicationId],
     );
@@ -149,7 +149,7 @@ export class ApplicationService {
     }
 
     const row = await this.db.one<{ id: string; name: string; base_url: string }>(
-      `INSERT INTO ${this.schema}.services (application_id, name, base_url)
+      `INSERT INTO ${this.schema}.agent_services (application_id, name, base_url)
        VALUES ($1, $2, $3)
        ON CONFLICT (application_id, name) DO UPDATE
          SET base_url = EXCLUDED.base_url, updated_at = now()
@@ -166,7 +166,7 @@ export class ApplicationService {
 
   async removeService(applicationId: number, name: string): Promise<void> {
     await this.db.query(
-      `DELETE FROM ${this.schema}.services WHERE application_id = $1 AND name = $2`,
+      `DELETE FROM ${this.schema}.agent_services WHERE application_id = $1 AND name = $2`,
       [applicationId, name],
     );
   }

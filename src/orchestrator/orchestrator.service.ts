@@ -266,7 +266,9 @@ export class OrchestratorService {
       const message =
         catalogue.length === 0
           ? ORI_STATIC_FALLBACKS.nothingConfigured
-          : ORI_STATIC_FALLBACKS.notUnderstood;
+          : plan.fallbackCause === 'llm-unavailable'
+            ? ORI_STATIC_FALLBACKS.llmUnavailable
+            : ORI_STATIC_FALLBACKS.notUnderstood;
 
       emit({ type: 'message.delta', channel: 'user', text: message });
 
@@ -415,7 +417,7 @@ export class OrchestratorService {
   ): Promise<void> {
     await this.db
       .query(
-        `INSERT INTO ${quoteIdent(this.db.schema)}.runs
+        `INSERT INTO ${quoteIdent(this.db.schema)}.agent_runs
            (application_id, run_key, conversation_key, end_user_id, end_user_role, streamed)
          VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (run_key) DO NOTHING`,
@@ -445,7 +447,7 @@ export class OrchestratorService {
   ): Promise<void> {
     await this.db
       .query(
-        `UPDATE ${quoteIdent(this.db.schema)}.runs
+        `UPDATE ${quoteIdent(this.db.schema)}.agent_runs
             SET status = $2, intent = $3, response_type = $4,
                 functions_used = $5, latency_ms = $6, error = $7,
                 completed_at = now()
@@ -460,6 +462,17 @@ export class OrchestratorService {
           error,
         ],
       )
-      .catch(() => undefined);
+      .catch((failure: unknown) => {
+        // Still never fails the request — but it says so. This swallowing was
+        // total, and a run that cannot be closed stays "in flight" forever in
+        // the console. Combined with an open that also failed, it is how a
+        // mistyped table name went unnoticed until the database was queried by
+        // hand.
+        this.logger.warn(
+          `Could not close run record: ${
+            failure instanceof Error ? failure.message : String(failure)
+          }`,
+        );
+      });
   }
 }
