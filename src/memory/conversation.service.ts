@@ -57,7 +57,7 @@ export class ConversationService {
   ): Promise<string> {
     if (conversationKey) {
       const owned = await this.db.one<{ id: string }>(
-        `SELECT id FROM ${this.schema}.conversations
+        `SELECT id FROM ${this.schema}.agent_conversations
           WHERE conversation_key = $1 AND application_id = $2 AND end_user_id = $3
           LIMIT 1`,
         [conversationKey, context.application.id, context.endUser.id],
@@ -71,7 +71,7 @@ export class ConversationService {
 
     const key = randomUUID();
     await this.db.query(
-      `INSERT INTO ${this.schema}.conversations
+      `INSERT INTO ${this.schema}.agent_conversations
          (application_id, conversation_key, end_user_id, end_user_role)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (conversation_key) DO NOTHING`,
@@ -93,14 +93,14 @@ export class ConversationService {
     metadata: Record<string, unknown> = {},
   ): Promise<void> {
     await this.db.query(
-      `INSERT INTO ${this.schema}.messages (conversation_id, role, content, metadata)
-       SELECT id, $2, $3, $4::jsonb FROM ${this.schema}.conversations
+      `INSERT INTO ${this.schema}.agent_messages (conversation_id, role, content, metadata)
+       SELECT id, $2, $3, $4::jsonb FROM ${this.schema}.agent_conversations
         WHERE conversation_key = $1`,
       [conversationKey, role, content, JSON.stringify(metadata)],
     );
 
     await this.db.query(
-      `UPDATE ${this.schema}.conversations
+      `UPDATE ${this.schema}.agent_conversations
           SET updated_at = now(),
               message_count = message_count + 1,
               -- First user turn names the conversation, so the dashboard has
@@ -115,8 +115,8 @@ export class ConversationService {
   async getHistory(conversationKey: string): Promise<ConversationTurn[]> {
     const rows = await this.db.query<{ role: string; content: string }>(
       `SELECT m.role, m.content
-         FROM ${this.schema}.messages m
-         JOIN ${this.schema}.conversations c ON c.id = m.conversation_id
+         FROM ${this.schema}.agent_messages m
+         JOIN ${this.schema}.agent_conversations c ON c.id = m.conversation_id
         WHERE c.conversation_key = $1
         ORDER BY m.created_at DESC, m.id DESC
         LIMIT $2`,
@@ -134,7 +134,7 @@ export class ConversationService {
     pending: PendingDisambiguation,
   ): Promise<void> {
     await this.db.query(
-      `UPDATE ${this.schema}.conversations
+      `UPDATE ${this.schema}.agent_conversations
           SET pending_state = $2::jsonb, updated_at = now()
         WHERE conversation_key = $1`,
       [conversationKey, JSON.stringify(pending)],
@@ -147,7 +147,7 @@ export class ConversationService {
     const row = await this.db.one<{
       pending_state: PendingDisambiguation | null;
     }>(
-      `SELECT pending_state FROM ${this.schema}.conversations
+      `SELECT pending_state FROM ${this.schema}.agent_conversations
         WHERE conversation_key = $1`,
       [conversationKey],
     );
@@ -165,7 +165,7 @@ export class ConversationService {
 
   async clearPending(conversationKey: string): Promise<void> {
     await this.db.query(
-      `UPDATE ${this.schema}.conversations SET pending_state = NULL
+      `UPDATE ${this.schema}.agent_conversations SET pending_state = NULL
         WHERE conversation_key = $1`,
       [conversationKey],
     );
@@ -186,7 +186,7 @@ export class ConversationService {
       updated_at: Date;
     }>(
       `SELECT conversation_key, end_user_id, end_user_role, title, message_count, updated_at
-         FROM ${this.schema}.conversations
+         FROM ${this.schema}.agent_conversations
         WHERE application_id = $1
         ORDER BY updated_at DESC
         LIMIT $2 OFFSET $3`,
@@ -213,8 +213,8 @@ export class ConversationService {
       created_at: Date;
     }>(
       `SELECT m.role, m.content, m.metadata, m.created_at
-         FROM ${this.schema}.messages m
-         JOIN ${this.schema}.conversations c ON c.id = m.conversation_id
+         FROM ${this.schema}.agent_messages m
+         JOIN ${this.schema}.agent_conversations c ON c.id = m.conversation_id
         WHERE c.conversation_key = $1
         ORDER BY m.created_at, m.id`,
       [conversationKey],

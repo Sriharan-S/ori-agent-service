@@ -27,6 +27,12 @@ export interface ExecutionPlan {
   reasoning: string;
   requiresSynthesis: boolean;
   isFallback: boolean;
+  /**
+   * Why an empty plan is empty. "The model is unreachable" and "the model read
+   * the question and had nothing to call" need different things said to the
+   * user, and send an operator looking in different places.
+   */
+  fallbackCause?: 'llm-unavailable' | 'not-understood';
 }
 
 export interface CallOutcome {

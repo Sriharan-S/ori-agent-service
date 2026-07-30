@@ -218,6 +218,7 @@ export class OpenAiCompatibleProvider {
         this.name,
         null,
         true,
+        error,
       );
     } finally {
       // Cleared once headers are in; the body stream is read after this and is

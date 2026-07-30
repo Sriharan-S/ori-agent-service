@@ -5,12 +5,18 @@ import { AdminAuthService } from './admin-auth.service';
 import { AdminSessionGuard } from './admin-session.guard';
 import { AdminController } from './admin.controller';
 import { DashboardController } from './dashboard.controller';
+import { DatabaseInfoService } from './database-info.service';
 import { ObservabilityService } from './observability.service';
 
 @Module({
   imports: [AuthModule, ManagementModule],
   controllers: [AdminController, DashboardController],
-  providers: [AdminAuthService, AdminSessionGuard, ObservabilityService],
-  exports: [AdminAuthService, ObservabilityService],
+  providers: [
+    AdminAuthService,
+    AdminSessionGuard,
+    ObservabilityService,
+    DatabaseInfoService,
+  ],
+  exports: [AdminAuthService, ObservabilityService, DatabaseInfoService],
 })
 export class AdminModule {}

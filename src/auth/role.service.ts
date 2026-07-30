@@ -72,7 +72,7 @@ export class RoleService {
     const row = await this.db.one<RoleRow>(
       `SELECT id, application_id, name, description,
               allowed_functions, write_scopes, unscoped_keys
-         FROM ${this.schema}.roles
+         FROM ${this.schema}.agent_roles
         WHERE application_id = $1 AND name = $2
         LIMIT 1`,
       [applicationId, name],
@@ -92,7 +92,7 @@ export class RoleService {
     const rows = await this.db.query<RoleRow>(
       `SELECT id, application_id, name, description,
               allowed_functions, write_scopes, unscoped_keys
-         FROM ${this.schema}.roles
+         FROM ${this.schema}.agent_roles
         WHERE application_id = $1
         ORDER BY name`,
       [applicationId],
@@ -105,7 +105,7 @@ export class RoleService {
     input: Omit<RoleRecord, 'id' | 'applicationId'>,
   ): Promise<RoleRecord> {
     const row = await this.db.one<RoleRow>(
-      `INSERT INTO ${this.schema}.roles
+      `INSERT INTO ${this.schema}.agent_roles
          (application_id, name, description, allowed_functions, write_scopes, unscoped_keys)
        VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (application_id, name) DO UPDATE
@@ -132,7 +132,7 @@ export class RoleService {
 
   async remove(applicationId: number, name: string): Promise<void> {
     await this.db.query(
-      `DELETE FROM ${this.schema}.roles WHERE application_id = $1 AND name = $2`,
+      `DELETE FROM ${this.schema}.agent_roles WHERE application_id = $1 AND name = $2`,
       [applicationId, name],
     );
     this.cache.delete(`${applicationId}:${name}`);

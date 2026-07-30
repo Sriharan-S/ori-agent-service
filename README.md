@@ -23,11 +23,27 @@ or a management API.
   SQL (reads) and declarative HTTP calls (writes) through a web console.
   Postgres itself validates every function before it can be saved.
 - **An operator console** at `/admin`: live activity, run traces, conversation
-  transcripts, the function editor, model management, API keys, audit log.
+  transcripts, the function editor, model management, connection diagnostics,
+  API keys, audit log — and a guide covering all of it. Works on a phone.
+- **Guided setup.** A missing variable, an unreachable database or a role that
+  may not create tables produces a setup screen that says which step is
+  outstanding and how to fix it, not a process that exits.
+- **An API reference** at `/docs`, generated from the code and self-hosted.
 - **Multi-tenant.** One deployment serves many applications; nothing crosses
   between them.
 - **Ambiguity that asks instead of guessing.** When a lookup could mean several
   records, the agent returns a clarifying question and remembers the answer.
+
+## It has no database of its own
+
+You point it at a Postgres you already run. It creates its own tables inside it,
+every one named `agent_*`, in one schema (`ori` by default). Nothing it creates
+touches a table that was already there, and which tables belong to the agent is
+obvious from the name alone.
+
+If the connected role may not create tables — common on managed Postgres — the
+setup screen hands you the exact DDL to give to whoever can, then adopts the
+schema once it exists.
 
 ---
 
@@ -49,8 +65,8 @@ Two database connections, deliberately different:
 
 | Connection | Used for | Privileges |
 |---|---|---|
-| `DATABASE_URL` | The agent's own schema — registry, conversations, audit, keys | read/write |
-| `DATABASE_READ_URL` | **Only** for running registry functions | read-only, proven at boot |
+| `DATABASE_URL` | The agent's own `agent_*` tables — registry, conversations, audit, keys | read/write |
+| `DATABASE_READ_URL` | **Only** for running registry functions | read-only, proven before the pool opens |
 
 ---
 
@@ -60,8 +76,8 @@ Two database connections, deliberately different:
 cp .env.example .env
 ```
 
-Fill in `DATABASE_URL`, `DATABASE_READ_URL`, `ENCRYPTION_KEY`, and the bootstrap
-admin. Generate a key with:
+Fill in `DATABASE_URL`, `DATABASE_READ_URL` and `ENCRYPTION_KEY`. Generate the
+key with:
 
 ```bash
 openssl rand -base64 32
@@ -70,7 +86,7 @@ openssl rand -base64 32
 Create the read-only role (once, as a database owner):
 
 ```bash
-psql "$DATABASE_URL" -c "CREATE ROLE ori_reader LOGIN PASSWORD 'choose-one'; GRANT CONNECT ON DATABASE yourdb TO ori_reader; GRANT USAGE ON SCHEMA public TO ori_reader; GRANT SELECT ON ALL TABLES IN SCHEMA public TO ori_reader; ALTER ROLE ori_reader SET default_transaction_read_only = on;"
+psql "$DATABASE_URL" -c "CREATE ROLE ori_reader LOGIN PASSWORD 'choose-one'; GRANT CONNECT ON DATABASE yourdb TO ori_reader; GRANT USAGE ON SCHEMA public TO ori_reader; GRANT SELECT ON ALL TABLES IN SCHEMA public TO ori_reader; ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ori_reader;"
 ```
 
 Then:
@@ -79,17 +95,35 @@ Then:
 npm install && npm run start:dev
 ```
 
-Open `http://localhost:3200/admin`, sign in with the bootstrap account, and:
+Open `http://localhost:3200/admin`. If anything above is missing or wrong you
+get a setup screen naming the step and the fix, with a button that re-checks in
+place — no restart, no reading the log. It walks through the database
+connection, the agent tables, the read-only role, and creating the first
+operator account.
+
+Once you are in:
 
 1. **Create an application** — your product. Choose how it identifies end users.
+   It arrives with a live `demo` function so there is something to test against
+   immediately.
 2. **Define roles** — which functions each role may call, and which data scopes
    it is exempt from.
 3. **Add a model** — any OpenAI-compatible endpoint (vLLM, or a hosted API).
-4. **Write a function.** Validate, approve, take it live.
+   **Test connection** before saving; an unreachable model is otherwise only
+   noticed by the next real chat request.
+4. **Write a function.** Validate, **Try it** as any role, approve, take it live.
 5. **Issue an API key** and call `/v1/chat`.
 
-The service refuses to start if `DATABASE_READ_URL` accepts a write. That is
-intentional — see *Why that matters* below.
+The **Guide** in the console covers all of this end to end, with worked
+examples. It ships with the console rather than linking out, because the console
+is what you open when the network is misbehaving.
+
+The **Database** tab shows both connections, their pool state, which `agent_*`
+tables exist, and whether the read connection has been proven unable to write —
+passwords are never rendered.
+
+If `DATABASE_READ_URL` can write, the read pool is never opened and no registry
+function can run. That is intentional — see *Why that matters* below.
 
 ---
 
@@ -164,9 +198,13 @@ Full guide: [docs/FUNCTION_AUTHORING.md](./docs/FUNCTION_AUTHORING.md).
 Registry SQL is authored by a human, but it is stored as **data**, and data is
 not reviewed code. Three things contain it:
 
-1. **The read connection cannot write.** Proven at boot by attempting a write
-   and refusing to start if it succeeds. Give it primary credentials and the
-   service will not boot.
+1. **The read connection cannot write.** Checked before the pool is opened: the
+   service asks Postgres whether that role holds any write privilege on any
+   table, and if it does the pool is never created — so no registry function can
+   run at all, and the console says which tables are writable. (It does *not*
+   test by creating a temp table — Postgres grants `TEMP` to `PUBLIC`, so that
+   probe rejects every correctly configured role while proving nothing about
+   your data.)
 2. **Postgres validates every function before it saves** — not a regex. The
    predecessor to this service tried to police LLM-generated SQL with a
    six-step regex pipeline and had three confirmed bypasses, all of them
@@ -227,8 +265,17 @@ src/
   memory/         conversations, pending disambiguation
   orchestrator/   router, planner, executor, reflector, synthesizer
   registry/       function contract, SQL template engine, runners, validator
+  setup/          onboarding: stage detection, manual DDL, first account
   audit/          per-call audit records
-public/           the console — three files, no build step, no CDN
+public/           the console — plain modules, no build step, no CDN
+  index.html      shell
+  styles.css      tokens and components
+  ui.js           DOM helpers and the component vocabulary
+  app.js          API client, hash router, sidebar shell
+  views.js        activity, functions, roles, models, applications, database
+  function-editor.js   the authoring page
+  setup.js        the onboarding wizard
+  guide.js        the in-app manual
 test/             unit, security, eval
 docs/             SECURITY, FUNCTION_AUTHORING, PORT_AUDIT
 ```
@@ -267,4 +314,4 @@ Not built yet:
 
 Nothing has run against a production database yet. The first thing you will
 exercise is the read-connection write assertion, which is designed to refuse to
-boot on the wrong credentials.
+open the connection on the wrong credentials.

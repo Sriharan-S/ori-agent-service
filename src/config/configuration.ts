@@ -1,3 +1,9 @@
+// Loaded here rather than relying on ConfigModule: `loadConfiguration()` is
+// called while this module is being imported, which happens before Nest has
+// initialised anything. dotenv does not override variables that are already
+// set, so a real environment (Docker, CI, production) still wins.
+import 'dotenv/config';
+
 /**
  * Typed configuration loaded once at boot.
  *
@@ -91,6 +97,20 @@ function str(value: string | undefined, fallback = ''): string {
   return value === undefined || value === '' ? fallback : value;
 }
 
+/**
+ * A pino level, or the default.
+ *
+ * pino throws on an unknown level, and that throw happens inside the logger
+ * factory during module initialisation — so `LOG_LEVEL=log` took the whole
+ * service down with "default level:log must be included in custom levels".
+ * Nothing about a log level is worth refusing to start over.
+ */
+function level(value: string | undefined): string {
+  const allowed = ['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent'];
+  const chosen = str(value, 'info').toLowerCase();
+  return allowed.includes(chosen) ? chosen : 'info';
+}
+
 function list(value: string | undefined): string[] {
   return str(value)
     .split(',')
@@ -107,7 +127,7 @@ export function loadConfiguration(): AppConfig {
     service: {
       port,
       nodeEnv,
-      logLevel: str(env.LOG_LEVEL, 'info'),
+      logLevel: level(env.LOG_LEVEL),
       isProduction: nodeEnv === 'production',
       publicUrl: str(env.PUBLIC_URL, `http://localhost:${port}`),
     },
@@ -169,55 +189,140 @@ export function loadConfiguration(): AppConfig {
   };
 }
 
-/** Fail fast on misconfiguration rather than 500-ing on the first request. */
-export function validateConfig(config: AppConfig): void {
-  const missing: string[] = [];
+export interface ConfigProblem {
+  variable: string;
+  /** `blocking` means the service cannot do its job until it is fixed. */
+  severity: 'blocking' | 'warning';
+  message: string;
+  fix: string;
+}
 
-  if (!config.db.primaryUrl) missing.push('DATABASE_URL');
-  if (!config.db.readUrl) missing.push('DATABASE_READ_URL');
-  if (!config.security.encryptionKey) missing.push('ENCRYPTION_KEY');
+/**
+ * Everything wrong with the environment, as data.
+ *
+ * This used to throw, which meant a first deployment with a typo in
+ * `DATABASE_URL` exited before it could serve anything — including the page
+ * that would have explained the typo. Configuration problems are now reported
+ * to the setup screen instead, so the fix is visible in the place you are
+ * already looking.
+ *
+ * `validateConfig` still exists for the one class of problem where continuing
+ * is worse than stopping: an explicitly disabled security guarantee in
+ * production.
+ */
+export function inspectConfiguration(config: AppConfig): ConfigProblem[] {
+  const problems: ConfigProblem[] = [];
 
-  if (missing.length > 0) {
-    throw new Error(
-      `Missing required environment variables: ${missing.join(', ')}. See .env.example.`,
-    );
+  if (!config.db.primaryUrl) {
+    problems.push({
+      variable: 'DATABASE_URL',
+      severity: 'blocking',
+      message:
+        'No database is configured. This service keeps its own tables inside a ' +
+        'Postgres database you already run; it does not have one of its own.',
+      fix: 'DATABASE_URL=postgres://user:password@host:5432/your_database',
+    });
   }
 
-  if (decodeEncryptionKey(config.security.encryptionKey).length !== 32) {
-    throw new Error(
-      'ENCRYPTION_KEY must decode to exactly 32 bytes (base64 or hex). ' +
-        'Generate one with: openssl rand -base64 32',
-    );
-  }
-
-  if (config.service.isProduction && config.db.allowWritableReadPool) {
-    throw new Error(
-      'DB_ALLOW_WRITABLE_READ_POOL must never be true in production. It disables ' +
-        'the guarantee that admin-authored SQL cannot write.',
-    );
+  if (!config.db.readUrl) {
+    problems.push({
+      variable: 'DATABASE_READ_URL',
+      severity: 'blocking',
+      message:
+        'No read-only connection is configured. Registry functions run on it, and ' +
+        'the fact that it cannot write is what makes running them safe.',
+      fix: 'DATABASE_READ_URL=postgres://readonly_user:password@host:5432/your_database',
+    });
   }
 
   if (
+    config.db.primaryUrl &&
     config.db.primaryUrl === config.db.readUrl &&
     !config.db.allowWritableReadPool
   ) {
-    // Not fatal — the boot assertion is the real check, and it will fail if
-    // these credentials can write. Named here because it is nearly always a
-    // copy-paste error rather than an intentional read-only primary.
-    throw new Error(
-      'DATABASE_URL and DATABASE_READ_URL are identical. DATABASE_READ_URL must ' +
-        'use a read-only role or a replica endpoint — it is the only thing ' +
-        'preventing an admin-authored function from writing.',
-    );
+    problems.push({
+      variable: 'DATABASE_READ_URL',
+      severity: 'blocking',
+      message:
+        'DATABASE_URL and DATABASE_READ_URL are identical, so the read connection ' +
+        'can write. This is nearly always a copy-paste error.',
+      fix: 'Point DATABASE_READ_URL at a SELECT-only role or a read replica.',
+    });
+  }
+
+  if (!config.security.encryptionKey) {
+    problems.push({
+      variable: 'ENCRYPTION_KEY',
+      severity: 'blocking',
+      message:
+        'No encryption key is set. Model provider credentials are encrypted at ' +
+        'rest with it, so no model can be saved without one.',
+      fix: 'Generate one with: openssl rand -base64 32',
+    });
+  } else if (decodeEncryptionKey(config.security.encryptionKey).length !== 32) {
+    problems.push({
+      variable: 'ENCRYPTION_KEY',
+      severity: 'blocking',
+      message:
+        'ENCRYPTION_KEY must decode to exactly 32 bytes, as base64 or hex. ' +
+        `This one decodes to ${decodeEncryptionKey(config.security.encryptionKey).length}.`,
+      fix: 'Generate one with: openssl rand -base64 32',
+    });
+  }
+
+  if (
+    config.service.logLevel !== (process.env.LOG_LEVEL ?? 'info').toLowerCase() &&
+    process.env.LOG_LEVEL
+  ) {
+    problems.push({
+      variable: 'LOG_LEVEL',
+      severity: 'warning',
+      message: `"${process.env.LOG_LEVEL}" is not a log level, so "info" is being used instead.`,
+      fix: 'One of: trace, debug, info, warn, error, fatal, silent.',
+    });
+  }
+
+  if (config.db.allowWritableReadPool) {
+    problems.push({
+      variable: 'DB_ALLOW_WRITABLE_READ_POOL',
+      severity: 'warning',
+      message:
+        'The write guard is disabled, so a registry function could modify or ' +
+        'delete data. Intended for local development against a throwaway database.',
+      fix: 'Unset it, and give DATABASE_READ_URL a SELECT-only role.',
+    });
   }
 
   if (
     config.behaviour.defaultRowLimit > config.behaviour.maxRowLimit ||
     config.behaviour.maxRowLimit <= 0
   ) {
+    problems.push({
+      variable: 'MAX_ROW_LIMIT',
+      severity: 'blocking',
+      message:
+        `DEFAULT_ROW_LIMIT (${config.behaviour.defaultRowLimit}) must be less than ` +
+        `or equal to MAX_ROW_LIMIT (${config.behaviour.maxRowLimit}), which must be above zero.`,
+      fix: 'Set DEFAULT_ROW_LIMIT=50 and MAX_ROW_LIMIT=200, or values of your own.',
+    });
+  }
+
+  return problems;
+}
+
+/**
+ * The only configuration that still stops the process.
+ *
+ * Booting into a setup screen is the right answer for a missing variable. It is
+ * the wrong answer for an operator who has deliberately switched off the guard
+ * that contains administrator-authored SQL, in production, where there is real
+ * data to lose.
+ */
+export function validateConfig(config: AppConfig): void {
+  if (config.service.isProduction && config.db.allowWritableReadPool) {
     throw new Error(
-      `Invalid row limits: DEFAULT_ROW_LIMIT (${config.behaviour.defaultRowLimit}) ` +
-        `must be <= MAX_ROW_LIMIT (${config.behaviour.maxRowLimit}), and MAX_ROW_LIMIT > 0.`,
+      'DB_ALLOW_WRITABLE_READ_POOL must never be true in production. It disables ' +
+        'the guarantee that admin-authored SQL cannot write.',
     );
   }
 }

@@ -20,6 +20,7 @@ import type {
   ReturnShape,
 } from '../registry/function.contract';
 import type { ScopeFilterDefinition } from '../registry/sql-template';
+import { buildDemoFunction, DEMO_FUNCTION_NAME } from './demo-function';
 
 export interface FunctionInput {
   name: string;
@@ -122,7 +123,7 @@ export class FunctionManagementService {
     );
 
     const row = await this.db.one<{ id: string }>(
-      `INSERT INTO ${this.schema}.functions (
+      `INSERT INTO ${this.schema}.agent_functions (
          application_id, name, category, kind, description,
          when_to_use, when_not_to_use, parameters, required_one_of,
          returns, ambiguity_resolves_to, allowed_roles, scope_filters,
@@ -196,7 +197,7 @@ export class FunctionManagementService {
     );
 
     await this.db.query(
-      `UPDATE ${this.schema}.functions SET
+      `UPDATE ${this.schema}.agent_functions SET
          name = $3, category = $4, kind = $5, description = $6,
          when_to_use = $7::jsonb, when_not_to_use = $8::jsonb,
          parameters = $9::jsonb, required_one_of = $10::jsonb,
@@ -281,10 +282,13 @@ export class FunctionManagementService {
       );
     }
 
+    // `$4::bigint` is not decoration. Inside a CASE whose other branch is NULL,
+    // Postgres infers an untyped parameter as text, and assigning text to the
+    // bigint `approved_by` column fails at execution.
     await this.db.query(
-      `UPDATE ${this.schema}.functions
+      `UPDATE ${this.schema}.agent_functions
           SET status = $3,
-              approved_by = CASE WHEN $3 IN ('approved','live') THEN $4 ELSE NULL END,
+              approved_by = CASE WHEN $3 IN ('approved','live') THEN $4::bigint ELSE NULL END,
               approved_at = CASE WHEN $3 IN ('approved','live') THEN now() ELSE NULL END,
               updated_at = now()
         WHERE application_id = $1 AND name = $2`,
@@ -310,12 +314,55 @@ export class FunctionManagementService {
 
     await this.snapshot(current, actorId, 'deleted');
     await this.db.query(
-      `DELETE FROM ${this.schema}.functions WHERE application_id = $1 AND name = $2`,
+      `DELETE FROM ${this.schema}.agent_functions WHERE application_id = $1 AND name = $2`,
       [applicationId, name],
     );
 
     this.registry.invalidate(applicationId);
     this.logger.log(`Function "${name}" deleted`);
+  }
+
+  /**
+   * Create the demo function for an application, or bring it back if it was
+   * deleted. Returns null when it already exists and is untouched.
+   *
+   * Goes straight to `live` — unlike an author-written function, this one ships
+   * with the service and is validated the same way, so an approval step would be
+   * ceremony. If validation fails (an unusual Postgres, a restricted read role)
+   * it stays a draft with the error attached rather than being forced live.
+   */
+  async ensureDemoFunction(
+    applicationId: number,
+    agentSchema: string,
+  ): Promise<SaveResult | null> {
+    const existing = await this.registry.getByName(
+      applicationId,
+      DEMO_FUNCTION_NAME,
+    );
+    if (existing) return null;
+
+    const created = await this.create(
+      applicationId,
+      buildDemoFunction(agentSchema),
+      null,
+    );
+
+    if (created.validation.ok) {
+      await this.setStatus(applicationId, DEMO_FUNCTION_NAME, 'approved', null);
+      const live = await this.setStatus(
+        applicationId,
+        DEMO_FUNCTION_NAME,
+        'live',
+        null,
+      );
+      this.logger.log(`Demo function installed and live for app ${applicationId}`);
+      return { ...created, definition: live };
+    }
+
+    this.logger.warn(
+      `Demo function did not validate against this database: ${summarise(created.validation)}`,
+    );
+    return created;
   }
 
   async versions(functionId: number): Promise<VersionEntry[]> {
@@ -327,7 +374,7 @@ export class FunctionManagementService {
       snapshot: unknown;
     }>(
       `SELECT version, note, changed_by, changed_at, snapshot
-         FROM ${this.schema}.function_versions
+         FROM ${this.schema}.agent_function_versions
         WHERE function_id = $1
         ORDER BY version DESC, changed_at DESC`,
       [functionId],
@@ -349,7 +396,7 @@ export class FunctionManagementService {
   ): Promise<void> {
     await this.db
       .query(
-        `INSERT INTO ${this.schema}.function_versions
+        `INSERT INTO ${this.schema}.agent_function_versions
            (function_id, version, snapshot, note, changed_by)
          VALUES ($1, $2, $3::jsonb, $4, $5)
          ON CONFLICT (function_id, version) DO NOTHING`,

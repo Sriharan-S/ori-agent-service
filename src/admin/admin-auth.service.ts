@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Inject,
   Injectable,
   Logger,
@@ -57,7 +58,72 @@ export class AdminAuthService implements OnModuleInit {
   }
 
   async onModuleInit(): Promise<void> {
-    await this.bootstrap();
+    // The database may not be connected yet — that is a setup state, not a
+    // failure, and the setup screen is what resolves it.
+    if (!this.db.isReady()) return;
+    await this.ensureBootstrapAccount().catch((error: unknown) => {
+      this.logger.warn(
+        `Could not check for a first operator account: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
+  }
+
+  /**
+   * How many operator accounts exist.
+   *
+   * The setup flow uses this both to decide whether to ask for one and to
+   * refuse the request once one exists — an unauthenticated "create the first
+   * admin" endpoint is only safe while the answer is zero.
+   */
+  async countAdmins(): Promise<number> {
+    const row = await this.db.one<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM ${this.schema}.agent_admin_users`,
+    );
+    return Number(row?.count ?? 0);
+  }
+
+  /**
+   * Create the very first operator account, from the setup screen.
+   *
+   * Refuses once any account exists, so this cannot be used to add a second
+   * owner without signing in. The check and the insert are one statement for
+   * that reason: two concurrent setup submissions would otherwise both see zero.
+   */
+  async createFirstAdmin(
+    email: string,
+    password: string,
+    name: string | null,
+  ): Promise<AdminUser> {
+    const normalised = email.trim().toLowerCase();
+
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalised)) {
+      throw new BadRequestException('That does not look like an email address.');
+    }
+    if (password.length < 12) {
+      throw new BadRequestException(
+        'Use at least 12 characters. This account can read every conversation and ' +
+          'change what the agent is allowed to do.',
+      );
+    }
+
+    const row = await this.db.one<AdminRow>(
+      `INSERT INTO ${this.schema}.agent_admin_users (email, name, password_hash, role)
+       SELECT $1, $2, $3, 'owner'
+        WHERE NOT EXISTS (SELECT 1 FROM ${this.schema}.agent_admin_users)
+       RETURNING id, email, name, password_hash, role, is_active, last_login_at`,
+      [normalised, name, await hashPassword(password)],
+    );
+
+    if (!row) {
+      throw new BadRequestException(
+        'An account already exists, so setup is finished. Sign in instead.',
+      );
+    }
+
+    this.logger.log(`First operator account created: ${row.email}`);
+    return toUser(row);
   }
 
   async login(
@@ -67,7 +133,7 @@ export class AdminAuthService implements OnModuleInit {
   ): Promise<{ token: string; user: AdminUser; expiresAt: Date }> {
     const row = await this.db.one<AdminRow>(
       `SELECT id, email, name, password_hash, role, is_active, last_login_at
-         FROM ${this.schema}.admin_users
+         FROM ${this.schema}.agent_admin_users
         WHERE lower(email) = lower($1)`,
       [email],
     );
@@ -89,7 +155,7 @@ export class AdminAuthService implements OnModuleInit {
     );
 
     await this.db.query(
-      `INSERT INTO ${this.schema}.admin_sessions
+      `INSERT INTO ${this.schema}.agent_admin_sessions
          (admin_user_id, token_hash, expires_at, ip, user_agent)
        VALUES ($1, $2, $3, $4, $5)`,
       [
@@ -102,7 +168,7 @@ export class AdminAuthService implements OnModuleInit {
     );
 
     await this.db.query(
-      `UPDATE ${this.schema}.admin_users SET last_login_at = now() WHERE id = $1`,
+      `UPDATE ${this.schema}.agent_admin_users SET last_login_at = now() WHERE id = $1`,
       [row.id],
     );
 
@@ -115,8 +181,8 @@ export class AdminAuthService implements OnModuleInit {
 
     const row = await this.db.one<AdminRow>(
       `SELECT u.id, u.email, u.name, u.password_hash, u.role, u.is_active, u.last_login_at
-         FROM ${this.schema}.admin_sessions s
-         JOIN ${this.schema}.admin_users u ON u.id = s.admin_user_id
+         FROM ${this.schema}.agent_admin_sessions s
+         JOIN ${this.schema}.agent_admin_users u ON u.id = s.admin_user_id
         WHERE s.token_hash = $1 AND s.expires_at > now() AND u.is_active
         LIMIT 1`,
       [hashToken(token)],
@@ -129,7 +195,7 @@ export class AdminAuthService implements OnModuleInit {
   async logout(token: string | undefined): Promise<void> {
     if (!token) return;
     await this.db.query(
-      `DELETE FROM ${this.schema}.admin_sessions WHERE token_hash = $1`,
+      `DELETE FROM ${this.schema}.agent_admin_sessions WHERE token_hash = $1`,
       [hashToken(token)],
     );
   }
@@ -137,7 +203,7 @@ export class AdminAuthService implements OnModuleInit {
   async listUsers(): Promise<AdminUser[]> {
     const rows = await this.db.query<AdminRow>(
       `SELECT id, email, name, password_hash, role, is_active, last_login_at
-         FROM ${this.schema}.admin_users ORDER BY email`,
+         FROM ${this.schema}.agent_admin_users ORDER BY email`,
     );
     return rows.map(toUser);
   }
@@ -149,7 +215,7 @@ export class AdminAuthService implements OnModuleInit {
     role: AdminRole,
   ): Promise<AdminUser> {
     const row = await this.db.one<AdminRow>(
-      `INSERT INTO ${this.schema}.admin_users (email, name, password_hash, role)
+      `INSERT INTO ${this.schema}.agent_admin_users (email, name, password_hash, role)
        VALUES ($1, $2, $3, $4)
        RETURNING id, email, name, password_hash, role, is_active, last_login_at`,
       [email.toLowerCase(), name, await hashPassword(password), role],
@@ -159,13 +225,13 @@ export class AdminAuthService implements OnModuleInit {
 
   async setPassword(id: number, password: string): Promise<void> {
     await this.db.query(
-      `UPDATE ${this.schema}.admin_users SET password_hash = $2, updated_at = now()
+      `UPDATE ${this.schema}.agent_admin_users SET password_hash = $2, updated_at = now()
         WHERE id = $1`,
       [id, await hashPassword(password)],
     );
     // Every existing session for that account stops working.
     await this.db.query(
-      `DELETE FROM ${this.schema}.admin_sessions WHERE admin_user_id = $1`,
+      `DELETE FROM ${this.schema}.agent_admin_sessions WHERE admin_user_id = $1`,
       [id],
     );
   }
@@ -173,7 +239,7 @@ export class AdminAuthService implements OnModuleInit {
   /** Expired rows are dead weight and a small privacy liability. */
   async pruneSessions(): Promise<void> {
     await this.db
-      .query(`DELETE FROM ${this.schema}.admin_sessions WHERE expires_at < now()`)
+      .query(`DELETE FROM ${this.schema}.agent_admin_sessions WHERE expires_at < now()`)
       .catch(() => undefined);
   }
 
@@ -183,19 +249,15 @@ export class AdminAuthService implements OnModuleInit {
    * Only runs when the table is empty, so the bootstrap variables cannot be
    * used to reset an account later — change a password through the dashboard.
    */
-  private async bootstrap(): Promise<void> {
+  async ensureBootstrapAccount(): Promise<void> {
     const { bootstrapAdminEmail, bootstrapAdminPassword } =
       this.config.security;
 
-    const existing = await this.db.one<{ count: string }>(
-      `SELECT COUNT(*)::text AS count FROM ${this.schema}.admin_users`,
-    );
-    if (Number(existing?.count ?? 0) > 0) return;
+    if ((await this.countAdmins()) > 0) return;
 
     if (!bootstrapAdminEmail || !bootstrapAdminPassword) {
-      this.logger.warn(
-        'No dashboard account exists and BOOTSTRAP_ADMIN_EMAIL / ' +
-          'BOOTSTRAP_ADMIN_PASSWORD are not set. Nobody can sign in.',
+      this.logger.log(
+        'No operator account exists yet. Open /admin to create the first one.',
       );
       return;
     }

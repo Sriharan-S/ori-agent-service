@@ -3,6 +3,8 @@ import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { CONFIG, type AppConfig } from './config/configuration';
+import { setupOpenApi } from './api/openapi';
+import { SetupService } from './setup/setup.service';
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
@@ -17,20 +19,45 @@ async function bootstrap(): Promise<void> {
     }),
   );
 
+  setupOpenApi(app, config.service.publicUrl);
+
   // Required for the read pool's write assertion and clean pool shutdown.
   app.enableShutdownHooks();
 
   await app.listen(config.service.port);
 
-  new Logger('Bootstrap').log(
+  const logger = new Logger('Bootstrap');
+  logger.log(
     `Ori agent service listening on :${config.service.port} (${config.service.nodeEnv})`,
   );
+
+  // Say where onboarding stands rather than leaving it to be discovered. A
+  // half-configured deployment now serves a setup screen instead of exiting, so
+  // the log has to point at it.
+  const status = await app.get(SetupService).status();
+
+  if (status.complete) {
+    logger.log(`Console:  ${config.service.publicUrl}/admin`);
+    logger.log(`API docs: ${config.service.publicUrl}/docs`);
+
+    const incomplete = status.steps.filter((step) => step.state !== 'done');
+    for (const step of incomplete) {
+      logger.warn(`${step.title}: ${step.summary}`);
+    }
+  } else {
+    const step = status.steps.find((entry) => entry.id === status.stage);
+    logger.warn('Setup is not finished, so the service cannot serve requests yet.');
+    if (step) logger.warn(`Next: ${step.title} — ${step.summary}`);
+    logger.warn(`Finish setup at ${config.service.publicUrl}/admin`);
+  }
 }
 
 void bootstrap().catch((error: unknown) => {
-  // A failed boot is usually the read-replica write assertion or missing
-  // configuration. Both must stop the process rather than run degraded.
-   
+  // Missing configuration and an unreachable database are setup states now, not
+  // boot failures — they are reported by the setup screen. Reaching here means
+  // something genuinely unrecoverable, such as the port being taken or a
+  // security guarantee explicitly disabled in production.
+
   console.error(
     'Failed to start Ori agent service:',
     error instanceof Error ? error.message : error,

@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { CONFIG, type AppConfig } from '../config/configuration';
 import { LlmService } from '../llm/llm.service';
-import type { ChatMessage } from '../llm/llm.types';
+import { LlmError, type ChatMessage } from '../llm/llm.types';
 import type { PlannerFacingFunction } from '../registry/function.contract';
 import type { ConversationTurn } from '../memory/conversation.service';
 import type { ExecutionPlan, PlannedCall } from './orchestrator.types';
@@ -48,6 +48,7 @@ export class PlannerService {
         reasoning: 'No functions are available to this role.',
         requiresSynthesis: false,
         isFallback: true,
+        fallbackCause: 'not-understood',
       };
     }
 
@@ -76,12 +77,20 @@ export class PlannerService {
       if (plan.calls.length > 0) return plan;
 
       this.logger.warn('Planner returned no usable calls');
-      return fallbackPlan('planner selected nothing usable');
+      return fallbackPlan('planner selected nothing usable', 'not-understood');
     } catch (error) {
-      this.logger.warn(
-        `Planner failed: ${error instanceof Error ? error.message : String(error)}`,
+      const detail = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Planner failed: ${detail}`);
+
+      // No model configured, every model failing, or the breaker open — all of
+      // which mean the agent never got to read the question.
+      const unavailable =
+        error instanceof LlmError || /no enabled model|all .* failed/i.test(detail);
+
+      return fallbackPlan(
+        `planner unavailable: ${detail}`,
+        unavailable ? 'llm-unavailable' : 'not-understood',
       );
-      return fallbackPlan('planner unavailable');
     }
   }
 
@@ -239,11 +248,15 @@ Valid JSON only. No markdown fences, no commentary:
  * calling it with invented parameters — answering confidently about the wrong
  * record. Not answering beats answering wrongly.
  */
-function fallbackPlan(reason: string): ExecutionPlan {
+function fallbackPlan(
+  reason: string,
+  cause: NonNullable<ExecutionPlan['fallbackCause']>,
+): ExecutionPlan {
   return {
     calls: [],
     reasoning: `Fallback plan (${reason})`,
     requiresSynthesis: false,
     isFallback: true,
+    fallbackCause: cause,
   };
 }
