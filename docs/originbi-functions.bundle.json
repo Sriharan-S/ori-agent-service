@@ -1,0 +1,363 @@
+{
+  "bundle": "ori.function-bundle",
+  "version": 1,
+  "exportedAt": "2026-07-30T00:00:00.000Z",
+  "application": {
+    "slug": "originbi",
+    "name": "OriginBI"
+  },
+  "_notes": [
+    "Read functions for the OriginBI assessment platform.",
+    "Scope keys: corporate_account_id (B2B tenant), user_id (a student's own rows). ADMIN is exempt from both.",
+    "Every query is dedup-safe: the dev database is double-seeded (sessions, attempts, reports, corporate_accounts and groups all have exactly two physical rows per id, with no primary key). DISTINCT ON (id) and COUNT(DISTINCT id) make each function correct whether or not that is fixed.",
+    "Roles expected in the application: STUDENT, CORPORATE, ADMIN. Import this, create those roles, then take the functions live."
+  ],
+  "functions": [
+    {
+      "name": "find_candidate",
+      "category": "corporate",
+      "kind": "read",
+      "description": "Find one candidate (a registered person) within your company by their name, and return their assessment progress: which program, the status of their latest assessment session, and whether their report is ready. Accepts a full or partial name; when several people match, the agent asks which one.",
+      "whenToUse": [
+        "what is the status of candidate Priya Sharma",
+        "has Arjun finished his assessment",
+        "is the report ready for Shreyas Santhosh",
+        "look up candidate <name>"
+      ],
+      "whenNotToUse": [
+        "Not for listing everyone or counting candidates — use list_candidates or candidate_status_counts.",
+        "Not for a student asking about their own result — that is my_assessment_status."
+      ],
+      "parameters": {
+        "name": {
+          "type": "string",
+          "description": "The candidate's full or partial name, e.g. \"Priya\" or \"Priya Sharma\".",
+          "required": false,
+          "trim": true
+        },
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id. Only set this when resolving which candidate was meant after the agent has asked; normally search by name.",
+          "required": false
+        }
+      },
+      "requiredOneOf": [
+        [
+          "name",
+          "registration_id"
+        ]
+      ],
+      "returns": "single-or-ambiguous",
+      "ambiguityResolvesTo": "registration_id",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (r.id)\n       r.id AS id,\n       r.full_name AS label,\n       coalesce(p.name, 'no program') || ' · ' || coalesce(s.status, 'no session yet') AS detail,\n       CASE\n         WHEN r.id = {{param:registration_id}} THEN 100\n         WHEN lower(r.full_name) = lower({{param:name}}) THEN 100\n         ELSE 70\n       END AS match_score,\n       r.full_name,\n       coalesce(p.name, 'unassigned') AS program,\n       r.status AS registration_status,\n       coalesce(s.status, 'NO_SESSION') AS session_status,\n       coalesce(s.is_report_ready, false) AS report_ready\n  FROM registrations r\n  LEFT JOIN programs p ON p.id = r.program_id\n  LEFT JOIN assessment_sessions s ON s.registration_id = r.id\n WHERE r.is_deleted IS NOT TRUE\n   AND (\n        r.full_name ILIKE '%' || {{param:name}} || '%'\n     OR r.id = {{param:registration_id}}\n   )\n   AND {{scope:corporate_account_id}}\n ORDER BY r.id, s.created_at DESC NULLS LAST"
+    },
+    {
+      "name": "list_candidates",
+      "category": "corporate",
+      "kind": "read",
+      "description": "List the candidates registered under your company, each with their program and the status of their latest assessment session. Optionally filter to one session status. Returns many rows; for a single named person use find_candidate.",
+      "whenToUse": [
+        "show me our candidates",
+        "list everyone who has not started their assessment",
+        "which candidates are still in progress",
+        "who has completed the assessment"
+      ],
+      "whenNotToUse": [
+        "Not for a single named person — use find_candidate.",
+        "Not for just the numbers by status — use candidate_status_counts."
+      ],
+      "parameters": {
+        "session_status": {
+          "type": "string",
+          "description": "Restrict to candidates whose latest session has this status. Leave unset for all.",
+          "required": false,
+          "enum": [
+            "COMPLETED",
+            "IN_PROGRESS",
+            "EXPIRED",
+            "PARTIALLY_EXPIRED",
+            "NOT_STARTED",
+            "NO_SESSION"
+          ]
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (r.id)\n       r.id,\n       r.full_name,\n       coalesce(p.name, 'unassigned') AS program,\n       coalesce(s.status, 'NO_SESSION') AS session_status,\n       coalesce(s.is_report_ready, false) AS report_ready,\n       r.created_at\n  FROM registrations r\n  LEFT JOIN programs p ON p.id = r.program_id\n  LEFT JOIN assessment_sessions s ON s.registration_id = r.id\n WHERE r.is_deleted IS NOT TRUE\n   AND (cast({{param:session_status}} AS text) IS NULL OR coalesce(s.status, 'NO_SESSION') = {{param:session_status}})\n   AND {{scope:corporate_account_id}}\n ORDER BY r.id, s.created_at DESC NULLS LAST"
+    },
+    {
+      "name": "candidate_status_counts",
+      "category": "corporate",
+      "kind": "read",
+      "description": "Count your company's candidates grouped by the status of their latest assessment session (COMPLETED, IN_PROGRESS, EXPIRED, NOT_STARTED, and so on). Use this for \"how many\" questions rather than listing people.",
+      "whenToUse": [
+        "how many candidates have completed the assessment",
+        "give me a breakdown of our candidates by status",
+        "how many are still pending"
+      ],
+      "whenNotToUse": [
+        "Not for the actual names — use list_candidates.",
+        "Not for one person — use find_candidate."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT coalesce(s.status, 'NO_SESSION') AS session_status,\n       count(DISTINCT r.id) AS candidates\n  FROM registrations r\n  LEFT JOIN assessment_sessions s ON s.registration_id = r.id\n WHERE r.is_deleted IS NOT TRUE\n   AND {{scope:corporate_account_id}}\n GROUP BY coalesce(s.status, 'NO_SESSION')\n ORDER BY candidates DESC"
+    },
+    {
+      "name": "corporate_credit_balance",
+      "category": "corporate",
+      "kind": "read",
+      "description": "Show your company's assessment credit balance: how many credits are available now, how many were purchased in total, and whether the account is active.",
+      "whenToUse": [
+        "how many credits do we have left",
+        "what is our credit balance",
+        "is our account active"
+      ],
+      "whenNotToUse": [
+        "Not for candidates or assessments — this is only the credit balance."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "single",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "ca.id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (ca.id)\n       ca.id,\n       ca.company_name,\n       ca.available_credits,\n       ca.total_credits,\n       ca.is_active\n  FROM corporate_accounts ca\n WHERE {{scope:corporate_account_id}}\n ORDER BY ca.id"
+    },
+    {
+      "name": "find_corporate_account",
+      "category": "admin",
+      "kind": "read",
+      "description": "Administrator lookup of a corporate (company) account by company name, returning its credit balance and whether it is active. When several companies match, the agent asks which one.",
+      "whenToUse": [
+        "look up the corporate account for Touchmark",
+        "how many credits does <company> have",
+        "find company <name>"
+      ],
+      "whenNotToUse": [
+        "Not for a candidate or a person — use find_user or find_candidate.",
+        "Available to administrators only."
+      ],
+      "parameters": {
+        "company_name": {
+          "type": "string",
+          "description": "Full or partial company name, e.g. \"Touchmark\".",
+          "required": false,
+          "trim": true
+        },
+        "corporate_account_id": {
+          "type": "integer",
+          "description": "The corporate account id. Set only when resolving which company was meant after the agent asked.",
+          "required": false
+        }
+      },
+      "requiredOneOf": [
+        [
+          "company_name",
+          "corporate_account_id"
+        ]
+      ],
+      "returns": "single-or-ambiguous",
+      "ambiguityResolvesTo": "corporate_account_id",
+      "allowedRoles": [
+        "ADMIN"
+      ],
+      "scopeFilters": [],
+      "sqlTemplate": "SELECT DISTINCT ON (ca.id)\n       ca.id AS id,\n       ca.company_name AS label,\n       ca.available_credits::text || ' of ' || ca.total_credits::text || ' credits left' AS detail,\n       CASE\n         WHEN ca.id = {{param:corporate_account_id}} THEN 100\n         WHEN lower(ca.company_name) = lower({{param:company_name}}) THEN 100\n         ELSE 70\n       END AS match_score,\n       ca.company_name,\n       ca.available_credits,\n       ca.total_credits,\n       ca.is_active\n  FROM corporate_accounts ca\n WHERE ca.company_name ILIKE '%' || {{param:company_name}} || '%'\n    OR ca.id = {{param:corporate_account_id}}\n ORDER BY ca.id"
+    },
+    {
+      "name": "find_user",
+      "category": "admin",
+      "kind": "read",
+      "description": "Administrator lookup of a platform user by email address, returning their role (STUDENT, CORPORATE, AFFILIATE, ADMIN) and whether the account is active or blocked. When several emails match a partial search, the agent asks which one.",
+      "whenToUse": [
+        "find the user with email jane@example.com",
+        "is the account for <email> blocked",
+        "what role does <email> have"
+      ],
+      "whenNotToUse": [
+        "Not for a candidate's assessment progress — use find_candidate.",
+        "Available to administrators only."
+      ],
+      "parameters": {
+        "email": {
+          "type": "string",
+          "description": "Full or partial email address.",
+          "required": false,
+          "trim": true
+        },
+        "user_id": {
+          "type": "integer",
+          "description": "The user id. Set only when resolving which user was meant after the agent asked.",
+          "required": false
+        }
+      },
+      "requiredOneOf": [
+        [
+          "email",
+          "user_id"
+        ]
+      ],
+      "returns": "single-or-ambiguous",
+      "ambiguityResolvesTo": "user_id",
+      "allowedRoles": [
+        "ADMIN"
+      ],
+      "scopeFilters": [],
+      "sqlTemplate": "SELECT DISTINCT ON (u.id)\n       u.id AS id,\n       u.email AS label,\n       u.role || ' · ' || CASE WHEN u.is_blocked THEN 'blocked' WHEN u.is_active THEN 'active' ELSE 'inactive' END AS detail,\n       CASE\n         WHEN u.id = {{param:user_id}} THEN 100\n         WHEN lower(u.email) = lower({{param:email}}) THEN 100\n         ELSE 70\n       END AS match_score,\n       u.email,\n       u.role,\n       u.is_active,\n       u.is_blocked,\n       u.corporate_id\n  FROM users u\n WHERE u.email ILIKE '%' || {{param:email}} || '%'\n    OR u.id = {{param:user_id}}\n ORDER BY u.id"
+    },
+    {
+      "name": "platform_assessment_overview",
+      "category": "admin",
+      "kind": "read",
+      "description": "Administrator platform-wide count of assessment sessions grouped by status (COMPLETED, IN_PROGRESS, EXPIRED, and so on), across every company and student. Use for a health-of-the-platform overview.",
+      "whenToUse": [
+        "how many assessments have been completed across the platform",
+        "give me a platform-wide assessment breakdown",
+        "how many sessions are in progress overall"
+      ],
+      "whenNotToUse": [
+        "Not scoped to one company — for that use candidate_status_counts as that company.",
+        "Available to administrators only."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "ADMIN"
+      ],
+      "scopeFilters": [],
+      "sqlTemplate": "SELECT coalesce(s.status, 'NO_SESSION') AS session_status,\n       count(DISTINCT s.id) AS sessions\n  FROM assessment_sessions s\n GROUP BY coalesce(s.status, 'NO_SESSION')\n ORDER BY sessions DESC"
+    },
+    {
+      "name": "my_registration_status",
+      "category": "student",
+      "kind": "read",
+      "description": "For the signed-in student: their own registration details — their name, the program they registered for, the registration status, payment status, and whether AI counsellor access is enabled. Returns only the caller's own records.",
+      "whenToUse": [
+        "what is my name",
+        "what did I register for",
+        "what is my registration status",
+        "do I have AI counsellor access",
+        "what are my details"
+      ],
+      "whenNotToUse": [
+        "Not for assessment progress or reports — use my_assessment_status or my_report.",
+        "Only ever returns the caller's own data."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "r.user_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (r.id)\n       r.id,\n       r.full_name,\n       coalesce(p.name, 'unassigned') AS program,\n       r.status AS registration_status,\n       coalesce(r.payment_status, 'NONE') AS payment_status,\n       coalesce(r.has_ai_counsellor, false) AS ai_counsellor,\n       r.gender,\n       r.mobile_number,\n       r.created_at\n  FROM registrations r\n  LEFT JOIN programs p ON p.id = r.program_id\n WHERE r.is_deleted IS NOT TRUE\n   AND {{scope:user_id}}\n ORDER BY r.id DESC"
+    },
+    {
+      "name": "my_assessment_status",
+      "category": "student",
+      "kind": "read",
+      "description": "For the signed-in student: the status of their own assessment session(s) — which program, whether it is completed, in progress or expired, and whether the report is ready. Returns only the caller's own records.",
+      "whenToUse": [
+        "what is the status of my assessment",
+        "have I finished my assessment",
+        "is my assessment still in progress"
+      ],
+      "whenNotToUse": [
+        "Not for the report itself — use my_report.",
+        "Only ever returns the caller's own data."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "s.user_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (s.id)\n       s.id,\n       r.full_name,\n       coalesce(p.name, 'unassigned') AS program,\n       s.status AS session_status,\n       coalesce(s.is_report_ready, false) AS report_ready,\n       s.completed_at,\n       s.created_at\n  FROM assessment_sessions s\n  LEFT JOIN programs p ON p.id = s.program_id\n  LEFT JOIN registrations r ON r.id = s.registration_id\n WHERE {{scope:user_id}}\n ORDER BY s.id DESC"
+    },
+    {
+      "name": "my_report",
+      "category": "student",
+      "kind": "read",
+      "description": "For the signed-in student: their own assessment report(s), showing the report number, the program, when it was generated, and whether a downloadable report is available. Returns only the caller's own records.",
+      "whenToUse": [
+        "is my report ready",
+        "what is my report number",
+        "can I download my report"
+      ],
+      "whenNotToUse": [
+        "Not for whether the assessment itself is finished — use my_assessment_status.",
+        "Only ever returns the caller's own data."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "s.user_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (ar.id)\n       ar.id,\n       ar.report_number,\n       (ar.report_url IS NOT NULL) AS report_available,\n       ar.generated_at,\n       coalesce(p.name, 'unassigned') AS program\n  FROM assessment_reports ar\n  JOIN assessment_sessions s ON s.id = ar.assessment_session_id\n  LEFT JOIN programs p ON p.id = s.program_id\n WHERE {{scope:user_id}}\n ORDER BY ar.id DESC"
+    }
+  ]
+}
