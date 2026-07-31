@@ -42,6 +42,26 @@ const ALLOWED_FRAGMENTS = new Set([
   'compiled.sql',
   // Fixed column list constant in observability.service.ts.
   'AUDIT_COLUMNS',
+  /*
+   * Scope-sample lookup in database-info.service.ts.
+   *
+   * Postgres cannot bind an identifier as a parameter, so a query that reads
+   * "the distinct values of this column on that table" has to interpolate both.
+   * Justification, on the same principle as the schema name above:
+   *
+   *   - `relation` is `quoteIdent(schema) + '.' + quoteIdent(table)`, and
+   *     `scopeColumn` is `quoteIdent(column)`. `quoteIdent` *throws* on anything
+   *     that is not `[A-Za-z_][A-Za-z0-9_$]*`, so neither can carry punctuation.
+   *   - Both originate from configuration and the catalogue — a function's own
+   *     declared scope filter, an alias resolved from that function's SQL, or
+   *     `information_schema` — never from a request, an end user, or the LLM.
+   *   - The one actual *value*, the row limit, is bound as `$1`.
+   *
+   * If either name ever becomes reachable from request input, this entry must
+   * go and the feature with it.
+   */
+  'relation',
+  'scopeColumn',
 ]);
 
 function collectTypeScriptFiles(dir: string): string[] {

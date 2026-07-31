@@ -125,6 +125,10 @@ views.functions = async () => {
     pageHead('Functions',
       'The agent\'s entire vocabulary. It picks one of these and fills in the ' +
       'parameters — it never writes a query.',
+      functions.length
+        ? button('Export', { iconName: 'copy', onclick: () => exportFunctions() })
+        : null,
+      button('Import', { iconName: 'back', onclick: () => importFunctions() }),
       button('New function', {
         variant: 'primary',
         iconName: 'plus',
@@ -208,6 +212,94 @@ async function installDemo() {
   } catch (error) {
     toast(error.message, 'bad');
   }
+}
+
+/** Download every function as a JSON bundle. */
+async function exportFunctions() {
+  try {
+    const bundle = await api(appPath('/functions/export'));
+    const slug = bundle.application?.slug || 'functions';
+    const stamp = new Date().toISOString().slice(0, 10);
+    const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = el('a', { href: url, download: `ori-${slug}-functions-${stamp}.json` });
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    toast(`Exported ${bundle.functions.length} function(s).`, 'ok');
+  } catch (error) {
+    toast(error.message, 'bad');
+  }
+}
+
+/**
+ * Upload a bundle and show what happened to each function.
+ *
+ * Everything lands as a draft — a bundle is code from elsewhere and earns
+ * `live` the same way anything does, so the review step is deliberate rather
+ * than skipped. The result table separates "imported and validates" from
+ * "imported but needs a fix", because on a different database some SQL that was
+ * fine at export will not resolve here, and that is exactly what the author
+ * needs to see.
+ */
+function importFunctions() {
+  const picker = el('input', { type: 'file', accept: 'application/json,.json' });
+  const result = el('div');
+
+  const onFile = async () => {
+    const file = picker.files?.[0];
+    if (!file) return;
+
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch {
+      result.replaceChildren(notice('That file is not valid JSON.', 'bad'));
+      return;
+    }
+
+    result.replaceChildren(el('p', { class: 'muted' }, 'Validating against this database…'));
+
+    try {
+      const { outcomes } = await api(appPath('/functions/import'), { method: 'POST', body: parsed });
+      const ok = outcomes.filter((o) => o.action !== 'failed' && o.validates).length;
+      const needsFix = outcomes.filter((o) => o.action !== 'failed' && !o.validates).length;
+      const failed = outcomes.filter((o) => o.action === 'failed').length;
+
+      result.replaceChildren(
+        notice(
+          `${ok} ready, ${needsFix} imported but need a fix, ${failed} rejected. ` +
+          'All imported functions are drafts — review, then take live.',
+          failed ? 'bad' : needsFix ? 'warn' : 'ok'),
+        table(['Function', 'Action', 'Validates', 'Detail'],
+          outcomes.map((o) => [
+            o.name,
+            statusBadge(o.action),
+            o.action === 'failed' ? '—' : o.validates ? badge('yes', 'ok') : badge('no', 'warn'),
+            o.message ? el('span', { class: 'mono' }, o.message.slice(0, 120)) : '—',
+          ])),
+        el('div', { class: 'btnrow btnrow--end', style: 'margin-top:14px' },
+          button('Done', { variant: 'primary', onclick: () => { closeModal(); render(); } })));
+    } catch (error) {
+      result.replaceChildren(notice(error.message, 'bad'));
+    }
+  };
+
+  picker.addEventListener('change', onFile);
+
+  openModal('Import functions', frag(
+    el('p', { class: 'muted', style: 'font-size:13px;margin-bottom:12px' },
+      'Upload a bundle exported from here or from another deployment. Each function ' +
+      'is validated against this database and stored as a draft. Existing functions ' +
+      'with the same name are updated.'),
+    el('div', { class: 'btnrow' },
+      button('Choose a JSON file…', { iconName: 'inbox', onclick: () => picker.click() })),
+    picker,
+    el('div', { style: 'margin-top:14px' }, result),
+  ), { wide: true });
+
+  picker.style.display = 'none';
 }
 
 // ── Roles ───────────────────────────────────────────────────────────────────

@@ -193,6 +193,102 @@ export class DatabaseInfoService {
     }
   }
 
+  /**
+   * Real values for a scope key, so the playground can be used without guessing.
+   *
+   * A scope value is a tenant identifier the *caller* supplies — the agent has
+   * no way to derive one, and inventing one would be wrong. But an operator
+   * testing in the console has to type something, and "which corporate account
+   * ids exist" is a question they would otherwise answer by opening psql.
+   *
+   * Reads through the read-only connection, from the column the function itself
+   * declares, so nothing here needs to know a product's schema. Operator-only:
+   * it returns tenant identifiers, which is exactly what a scope value is.
+   */
+  async scopeSamples(
+    filters: Array<{ key: string; column: string; sql?: string | null }>,
+    limit = 25,
+  ): Promise<Record<string, Array<{ value: string; label: string }>>> {
+    const samples: Record<string, Array<{ value: string; label: string }>> = {};
+
+    for (const filter of filters) {
+      // A scope filter names `alias.column`, which is the shape the save-time
+      // validator enforces. The alias is meaningful only inside that function's
+      // own SQL, so resolve it there first: sampling the column name globally
+      // finds whichever table happens to be biggest, which for `user_id` is an
+      // answers table rather than the registrations table being scoped.
+      const [maybeAlias, maybeColumn] = filter.column.includes('.')
+        ? filter.column.split('.')
+        : [null, filter.column];
+
+      const column = (maybeColumn ?? filter.column).trim();
+      if (!/^[a-z_][a-z0-9_]*$/i.test(column)) continue;
+
+      const table =
+        (maybeAlias && filter.sql
+          ? resolveAlias(filter.sql, maybeAlias.trim())
+          : null) ?? (await this.tableForColumn(column));
+
+      if (!table) continue;
+
+      // Identifiers cannot be bound as parameters in Postgres, so the relation
+      // and column are interpolated — but only after `quoteIdent`, which throws
+      // on anything that is not an identifier. The row limit *is* a value and is
+      // bound, so nothing here reaches the query text as data.
+      const relation = `${quoteIdent(table.schema)}.${quoteIdent(table.name)}`;
+      const scopeColumn = quoteIdent(column);
+
+      try {
+        const result = await this.read.query<{ value: string; occurrences: string }>(
+          `SELECT ${scopeColumn}::text AS value, COUNT(*)::text AS occurrences
+             FROM ${relation}
+            WHERE ${scopeColumn} IS NOT NULL
+            GROUP BY 1
+            ORDER BY COUNT(*) DESC
+            LIMIT $1`,
+          [Math.min(Math.max(limit, 1), 100)],
+          { label: 'scope-samples' },
+        );
+
+        samples[filter.key] = result.rows.map((row) => ({
+          value: row.value,
+          label: `${row.value} · ${row.occurrences} row(s)`,
+        }));
+      } catch {
+        // A scope column the read role cannot see is not an error worth
+        // surfacing here — the playground simply offers no suggestions for it.
+        samples[filter.key] = [];
+      }
+    }
+
+    return samples;
+  }
+
+  /** The table a scope column lives on, chosen by how many rows carry it. */
+  private async tableForColumn(
+    column: string,
+  ): Promise<{ schema: string; name: string } | null> {
+    const rows = await this.read
+      .query<{ table_schema: string; table_name: string }>(
+        `SELECT c.table_schema, c.table_name
+           FROM information_schema.columns c
+           JOIN pg_class pc ON pc.relname = c.table_name
+           JOIN pg_namespace pn ON pn.oid = pc.relnamespace AND pn.nspname = c.table_schema
+          WHERE c.column_name = $1
+            AND c.table_schema NOT IN ('pg_catalog', 'information_schema')
+            AND pc.relkind IN ('r', 'p')
+            AND has_table_privilege(pc.oid, 'SELECT')
+          ORDER BY pc.reltuples DESC
+          LIMIT 1`,
+        [column],
+        { label: 'scope-samples' },
+      )
+      .catch(() => ({ rows: [] as Array<{ table_schema: string; table_name: string }> }));
+
+    const first = rows.rows[0];
+    return first ? { schema: first.table_schema, name: first.table_name } : null;
+  }
+
   /** Names of the agent's own tables, for the console. */
   async agentTableNames(): Promise<
     Array<{ name: string; qualified: string; exists: boolean }>
@@ -214,6 +310,35 @@ export class DatabaseInfoService {
       exists: present.has(name),
     }));
   }
+}
+
+/**
+ * The table an alias refers to, read out of the function's own SQL.
+ *
+ * Matches `FROM registrations r` and `JOIN assessment_sessions s ON …`, which is
+ * how every registry function is written. Returns null when the alias cannot be
+ * resolved, so the caller falls back to searching by column name — a wrong guess
+ * here would only mean less useful sample values, never a wrong query, because
+ * both the schema and table are quoted before use.
+ */
+function resolveAlias(
+  sql: string,
+  alias: string,
+): { schema: string; name: string } | null {
+  if (!/^[a-z_][a-z0-9_]*$/i.test(alias)) return null;
+
+  const pattern = new RegExp(
+    `\\b(?:FROM|JOIN)\\s+([a-z_][a-z0-9_]*)(?:\\.([a-z_][a-z0-9_]*))?\\s+(?:AS\\s+)?${alias}\\b`,
+    'i',
+  );
+
+  const match = pattern.exec(sql);
+  if (!match) return null;
+
+  // `schema.table alias` or just `table alias`.
+  return match[2]
+    ? { schema: match[1]!, name: match[2] }
+    : { schema: 'public', name: match[1]! };
 }
 
 /** Never throws — this powers a diagnostics page that must survive bad input. */
