@@ -51,6 +51,7 @@ export class LlmService {
   private readonly breaker: CircuitBreaker;
   private readonly metrics: LlmCallMetric[] = [];
   private readonly maxMetrics = 500;
+  private readonly maxAttemptsPerModel: number;
 
   constructor(
     @Inject(CONFIG) config: AppConfig,
@@ -60,32 +61,59 @@ export class LlmService {
       config.llm.breakerThreshold,
       config.llm.breakerCooldownMs,
     );
+    this.maxAttemptsPerModel = Math.max(1, config.llm.maxAttemptsPerModel);
   }
 
+  /**
+   * Non-streaming completion, with failover and a bounded retry per model.
+   *
+   * The retry is not defensive padding. Measured against a real endpoint, the
+   * same request with the same 90-token answer came back in 3.5s once and 74.5s
+   * the next time — the latency is a lottery unrelated to the work, so a single
+   * attempt loses that lottery a fraction of the time and takes the whole run
+   * down with it. This is the path the planner uses, so losing it means the agent
+   * never got to read the question at all.
+   *
+   * Only retryable failures are retried: a timeout or an empty completion is
+   * worth another go, a 400 or a 401 never is. Bounded by
+   * `LLM_MAX_ATTEMPTS_PER_MODEL` so a slow endpoint cannot multiply into the run
+   * timeout — with the default of 2 the worst case is two timeouts, not ten.
+   */
   async complete(
     messages: ChatMessage[],
     request: LlmRequest,
   ): Promise<CompletionResult> {
     const candidates = await this.candidates(request);
+    const maxTries = this.maxAttemptsPerModel;
     let lastError: unknown = null;
+    let attempt = 0;
 
-    for (let attempt = 0; attempt < candidates.length; attempt += 1) {
-      const model = candidates[attempt]!;
+    for (const model of candidates) {
       if (this.breaker.isOpen(String(model.id))) continue;
 
       const provider = new OpenAiCompatibleProvider(model);
 
-      try {
-        const result = await provider.complete(messages, {
-          context: request.purpose,
-          ...request,
-        });
+      for (let tries = 0; tries < maxTries; tries += 1) {
+        try {
+          const result = await provider.complete(messages, {
+            context: request.purpose,
+            ...request,
+          });
 
-        this.succeeded(model, request.purpose, result, attempt);
-        return result;
-      } catch (error) {
-        lastError = error;
-        this.failed(model, request.purpose, error, attempt);
+          this.succeeded(model, request.purpose, result, attempt);
+          return result;
+        } catch (error) {
+          lastError = error;
+          this.failed(model, request.purpose, error, attempt);
+          attempt += 1;
+
+          const retryable = error instanceof LlmError && error.retryable;
+          if (!retryable || tries === maxTries - 1) break;
+
+          this.logger.warn(
+            `${request.purpose}: retrying "${model.name}" (attempt ${tries + 2} of ${maxTries})`,
+          );
+        }
       }
     }
 
