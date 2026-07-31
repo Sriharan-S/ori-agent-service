@@ -50,6 +50,34 @@ export interface SaveResult {
   similar: Array<{ name: string; similarity: number }>;
 }
 
+/** Marks a JSON file as a function bundle and pins the shape it was written in. */
+export const FUNCTION_BUNDLE_TAG = 'ori.function-bundle';
+export const FUNCTION_BUNDLE_VERSION = 1;
+
+/**
+ * A portable set of functions.
+ *
+ * Everything authored — description, parameters, SQL, scopes, roles — and
+ * nothing runtime: no ids, no status, no validation state, no approval history.
+ * A bundle describes what a function *is*, so importing it anywhere re-derives
+ * the rest by validating against that deployment's own database.
+ */
+export interface FunctionBundle {
+  bundle: typeof FUNCTION_BUNDLE_TAG;
+  version: number;
+  exportedAt: string;
+  application?: { slug?: string; name?: string };
+  functions: FunctionInput[];
+}
+
+export interface ImportOutcome {
+  name: string;
+  action: 'created' | 'updated' | 'skipped' | 'failed';
+  validates: boolean;
+  /** Why it will not validate, or why it was rejected outright. */
+  message: string | null;
+}
+
 export interface VersionEntry {
   version: number;
   note: string | null;
@@ -365,6 +393,112 @@ export class FunctionManagementService {
     return created;
   }
 
+  /**
+   * Export every function of an application as a portable bundle.
+   *
+   * Runtime state is dropped on purpose. A function that was `live` here imports
+   * as a `draft` there, because "live" is a claim about a specific database that
+   * validated it and a person who approved it — neither of which travels in a
+   * file. The receiving deployment re-validates and re-approves.
+   */
+  async exportBundle(
+    applicationId: number,
+    slug?: string,
+    name?: string,
+  ): Promise<FunctionBundle> {
+    const definitions = await this.registry.listAll(applicationId);
+
+    return {
+      bundle: FUNCTION_BUNDLE_TAG,
+      version: FUNCTION_BUNDLE_VERSION,
+      exportedAt: new Date().toISOString(),
+      application: { slug, name },
+      functions: definitions.map(toInput),
+    };
+  }
+
+  /**
+   * Import a bundle, upserting each function as a draft.
+   *
+   * Nothing is promoted: a bundle is code arriving from elsewhere, and it earns
+   * `live` the same way anything else does — validated against this database,
+   * then approved by a person here. A function that fails to validate is still
+   * stored as a draft with its error, so the import is not all-or-nothing; the
+   * ones that are fine land, and the report says which need attention.
+   *
+   * The whole import runs in one transaction only for the row writes; each
+   * validation is a separate read-only call to Postgres and cannot be rolled
+   * into it, so a failure mid-way leaves earlier functions imported. That is the
+   * right trade — a bundle of ten where the eighth has a typo should import
+   * nine, not zero.
+   */
+  async importBundle(
+    applicationId: number,
+    bundle: unknown,
+    authorId: number | null,
+  ): Promise<{ outcomes: ImportOutcome[] }> {
+    const parsed = parseBundle(bundle);
+    const outcomes: ImportOutcome[] = [];
+    const seen = new Set<string>();
+
+    for (const input of parsed.functions) {
+      if (!input || typeof input.name !== 'string' || input.name.trim() === '') {
+        // We are here precisely because there is no usable name, so there is
+        // nothing meaningful to echo back — a placeholder is the honest label.
+        outcomes.push({
+          name: '(unnamed)',
+          action: 'failed',
+          validates: false,
+          message: 'A function in the bundle has no name.',
+        });
+        continue;
+      }
+
+      if (seen.has(input.name)) {
+        outcomes.push({
+          name: input.name,
+          action: 'skipped',
+          validates: false,
+          message: 'The bundle contains two functions with this name.',
+        });
+        continue;
+      }
+      seen.add(input.name);
+
+      try {
+        const existing = await this.registry.getByName(
+          applicationId,
+          input.name,
+        );
+        const result = existing
+          ? await this.update(applicationId, input.name, input, authorId)
+          : await this.create(applicationId, input, authorId);
+
+        outcomes.push({
+          name: input.name,
+          action: existing ? 'updated' : 'created',
+          validates: result.validation.ok,
+          message: result.validation.ok ? null : summarise(result.validation),
+        });
+      } catch (error) {
+        outcomes.push({
+          name: input.name,
+          action: 'failed',
+          validates: false,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    this.registry.invalidate(applicationId);
+    this.logger.log(
+      `Imported ${outcomes.filter((o) => o.action !== 'failed').length}/` +
+        `${outcomes.length} function(s) into app ${applicationId}`,
+    );
+
+    return { outcomes };
+  }
+
   async versions(functionId: number): Promise<VersionEntry[]> {
     const rows = await this.db.query<{
       version: number;
@@ -416,6 +550,96 @@ export class FunctionManagementService {
         );
       });
   }
+}
+
+/** The authored fields of a stored function, ready to re-import. */
+function toInput(definition: FunctionDefinition): FunctionInput {
+  return {
+    name: definition.name,
+    category: definition.category,
+    kind: definition.kind,
+    description: definition.description,
+    whenToUse: definition.whenToUse,
+    whenNotToUse: definition.whenNotToUse,
+    parameters: definition.parameters,
+    requiredOneOf: definition.requiredOneOf,
+    returns: definition.returns,
+    ambiguityResolvesTo: definition.ambiguityResolvesTo,
+    allowedRoles: definition.allowedRoles,
+    scopeFilters: definition.scopeFilters,
+    sqlTemplate: definition.sqlTemplate,
+    httpRequest: definition.httpRequest,
+    writeScope: definition.writeScope,
+    requiresConfirmation: definition.requiresConfirmation,
+    defaultLimit: definition.defaultLimit,
+    maxLimit: definition.maxLimit,
+  };
+}
+
+/**
+ * Turn an uploaded file into a bundle, or say why it is not one.
+ *
+ * Deliberately strict about the envelope and permissive about the contents: a
+ * missing tag is a wrong file and should be rejected loudly, but a function
+ * with an odd field is the validator's problem, not this one's — it will be
+ * caught, named, and reported per-function rather than failing the whole
+ * upload. Also accepts a bare array of functions, which is what someone hand-
+ * writing a bundle tends to produce first.
+ *
+ * Exported for tests: the envelope rules are worth pinning independently of a
+ * database.
+ */
+export function parseBundle(raw: unknown): FunctionBundle {
+  if (Array.isArray(raw)) {
+    return {
+      bundle: FUNCTION_BUNDLE_TAG,
+      version: FUNCTION_BUNDLE_VERSION,
+      exportedAt: new Date().toISOString(),
+      functions: raw as FunctionInput[],
+    };
+  }
+
+  if (typeof raw !== 'object' || raw === null) {
+    throw new BadRequestException(
+      'That is not a function bundle. Expected a JSON object with a "functions" array.',
+    );
+  }
+
+  const object = raw as Record<string, unknown>;
+
+  if (object.bundle !== undefined && object.bundle !== FUNCTION_BUNDLE_TAG) {
+    const tag =
+      typeof object.bundle === 'string' ? object.bundle : typeof object.bundle;
+    throw new BadRequestException(
+      `Unrecognised bundle tag "${tag}". Expected "${FUNCTION_BUNDLE_TAG}".`,
+    );
+  }
+
+  if (
+    typeof object.version === 'number' &&
+    object.version > FUNCTION_BUNDLE_VERSION
+  ) {
+    throw new BadRequestException(
+      `This bundle is version ${object.version}, but this service understands up to ${FUNCTION_BUNDLE_VERSION}. Upgrade the service.`,
+    );
+  }
+
+  if (!Array.isArray(object.functions)) {
+    throw new BadRequestException(
+      'The bundle has no "functions" array.',
+    );
+  }
+
+  return {
+    bundle: FUNCTION_BUNDLE_TAG,
+    version: FUNCTION_BUNDLE_VERSION,
+    exportedAt:
+      typeof object.exportedAt === 'string'
+        ? object.exportedAt
+        : new Date().toISOString(),
+    application: object.application as FunctionBundle['application'],
+    functions: object.functions as FunctionInput[],
+  };
 }
 
 function toDraft(
