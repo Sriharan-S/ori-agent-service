@@ -282,6 +282,37 @@ export class AdminController {
     return { functions: await this.registry.listAll(id, status) };
   }
 
+  // `export` and `import` are declared before the `:name` routes below, so that
+  // GET /functions/export is not captured as a function literally named "export".
+
+  /** Every function of an application as a portable JSON bundle. */
+  @Get('applications/:id/functions/export')
+  @UseGuards(AdminSessionGuard)
+  async exportFunctions(@Param('id', ParseIntPipe) id: number) {
+    const application = (await this.applications.list()).find(
+      (entry) => entry.id === id,
+    );
+    return this.functions.exportBundle(id, application?.slug, application?.name);
+  }
+
+  /**
+   * Import a bundle, upserting each function as a draft.
+   *
+   * Nothing goes live on import — a bundle is reviewed and promoted here like
+   * anything else. The response says, per function, what happened and whether it
+   * validates against this database.
+   */
+  @Post('applications/:id/functions/import')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async importFunctions(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() body: unknown,
+    @CurrentAdmin() admin: { id: number },
+  ) {
+    return this.functions.importBundle(id, body, admin.id);
+  }
+
   @Get('applications/:id/functions/:name')
   @UseGuards(AdminSessionGuard)
   async getFunction(
@@ -371,6 +402,67 @@ export class AdminController {
   ) {
     await this.functions.remove(id, name, admin.id);
     return { deleted: true };
+  }
+
+  /**
+   * What a given role must supply to call anything, and real values to use.
+   *
+   * The playground used to ask an operator to type scope values with no
+   * indication of which ones mattered or what a valid one looked like. This
+   * derives them: the scope keys of every live function the role may call, minus
+   * the keys the role is exempt from, each with sample values from the database.
+   *
+   * A role exempt from everything gets an empty list, which is the honest answer
+   * — an administrator supplies no scope because they are scoped to nothing.
+   */
+  @Get('applications/:id/roles/:name/scope-requirements')
+  @UseGuards(AdminSessionGuard)
+  async scopeRequirements(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('name') name: string,
+  ) {
+    const [role, functions] = await Promise.all([
+      this.roles.find(id, name),
+      this.registry.listAll(id, 'live'),
+    ]);
+
+    if (!role) {
+      return { role: name, exists: false, keys: [], exempt: [], samples: {} };
+    }
+
+    // Both sides have to agree, exactly as the runtime catalogue does.
+    const callable = functions.filter(
+      (fn) =>
+        (role.allowedFunctions.includes('*') ||
+          role.allowedFunctions.includes(fn.name)) &&
+        (fn.allowedRoles.includes('*') || fn.allowedRoles.includes(role.name)),
+    );
+
+    // Deduplicate by key, keeping the first function that declares it. Its SQL
+    // comes along so the alias in `alias.column` can be resolved to a real
+    // table — every function binding a key uses the same underlying identifier
+    // by definition, so any one of them will do.
+    const byKey = new Map<string, { column: string; sql: string | null }>();
+    for (const fn of callable) {
+      for (const filter of fn.scopeFilters) {
+        if (!byKey.has(filter.key)) {
+          byKey.set(filter.key, { column: filter.column, sql: fn.sqlTemplate });
+        }
+      }
+    }
+
+    const required = [...byKey.entries()]
+      .filter(([key]) => !role.unscopedKeys.includes(key))
+      .map(([key, entry]) => ({ key, column: entry.column, sql: entry.sql }));
+
+    return {
+      role: role.name,
+      exists: true,
+      callable: callable.map((fn) => fn.name),
+      keys: required.map((entry) => entry.key),
+      exempt: role.unscopedKeys,
+      samples: await this.database.scopeSamples(required),
+    };
   }
 
   // ── Roles ──────────────────────────────────────────────────────────────────
