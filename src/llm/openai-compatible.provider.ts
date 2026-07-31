@@ -7,12 +7,31 @@ import {
 import type { ResolvedModel } from './model-registry.service';
 
 interface ChatCompletionResponse {
-  choices?: Array<{ message?: { content?: string | null } }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  choices?: Array<{
+    message?: {
+      content?: string | null;
+      /**
+       * Reasoning models put their chain of thought here and the answer in
+       * `content`. Never used as the answer — it is read only to explain an
+       * empty one, which is the difference between "the model failed" and "the
+       * model thought until it ran out of tokens".
+       */
+      reasoning_content?: string | null;
+    };
+    finish_reason?: string | null;
+  }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    completion_tokens_details?: { reasoning_tokens?: number };
+  };
 }
 
 interface StreamChunk {
-  choices?: Array<{ delta?: { content?: string | null } }>;
+  choices?: Array<{
+    delta?: { content?: string | null; reasoning_content?: string | null };
+    finish_reason?: string | null;
+  }>;
   usage?: { prompt_tokens?: number; completion_tokens?: number };
 }
 
@@ -42,11 +61,12 @@ export class OpenAiCompatibleProvider {
     const response = await this.post(messages, options, false);
 
     const payload = (await response.json()) as ChatCompletionResponse;
-    const text = payload.choices?.[0]?.message?.content ?? '';
+    const choice = payload.choices?.[0];
+    const text = choice?.message?.content ?? '';
 
     if (!text.trim()) {
       throw new LlmError(
-        `${this.name} returned an empty completion`,
+        `${this.name} returned an empty completion${describeEmpty(payload)}`,
         this.name,
         null,
         true,
@@ -226,4 +246,40 @@ export class OpenAiCompatibleProvider {
       clearTimeout(timer);
     }
   }
+}
+
+/**
+ * Why a completion came back empty.
+ *
+ * "returned an empty completion" is true and useless — it sent an operator
+ * looking at the network when the actual cause was a reasoning model spending
+ * its entire token budget on chain of thought and never reaching an answer.
+ * `finish_reason: "length"` with reasoning tokens present says exactly that, and
+ * the fix (raise the model's max output tokens) is then obvious.
+ */
+function describeEmpty(payload: ChatCompletionResponse): string {
+  const choice = payload.choices?.[0];
+
+  if (!choice) return ' — the response contained no choices at all.';
+
+  const finish = choice.finish_reason ?? 'unspecified';
+  const reasoning =
+    choice.message?.reasoning_content?.trim() ??
+    (payload.usage?.completion_tokens_details?.reasoning_tokens
+      ? '(reasoning tokens reported)'
+      : '');
+
+  if (finish === 'length') {
+    return reasoning
+      ? ' — it stopped at the output-token limit while still reasoning, so no answer ' +
+          'was produced. Raise this model\'s max output tokens.'
+      : ' — it stopped at the output-token limit before producing any text. Raise ' +
+          "this model's max output tokens.";
+  }
+
+  if (reasoning) {
+    return ` — it produced reasoning but no answer (finish reason: ${finish}).`;
+  }
+
+  return ` — finish reason: ${finish}.`;
 }
