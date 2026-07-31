@@ -55,6 +55,13 @@ export interface AppConfig {
     defaultTemperature: number;
     breakerThreshold: number;
     breakerCooldownMs: number;
+    /**
+     * Attempts per model for a non-streaming call, before falling over to the
+     * next one. 2 means one retry. Raise it only for an endpoint whose failures
+     * are genuinely transient — every extra attempt is another timeout's worth
+     * of latency in the worst case.
+     */
+    maxAttemptsPerModel: number;
   };
   behaviour: {
     disambiguationGapThreshold: number;
@@ -154,6 +161,7 @@ export function loadConfiguration(): AppConfig {
       defaultTimeoutMs: num(env.LLM_TIMEOUT_MS, 30000),
       defaultMaxOutputTokens: num(env.LLM_MAX_OUTPUT_TOKENS, 1024),
       defaultTemperature: num(env.LLM_TEMPERATURE, 0.1),
+      maxAttemptsPerModel: num(env.LLM_MAX_ATTEMPTS_PER_MODEL, 2),
       breakerThreshold: num(env.LLM_BREAKER_THRESHOLD, 5),
       breakerCooldownMs: num(env.LLM_BREAKER_COOLDOWN_MS, 30000),
     },

@@ -78,15 +78,39 @@ export interface AgentRun {
  * on the calling key holding the `trace` scope. An end-user surface gets the
  * user channel only; an operator dashboard gets both.
  */
+/**
+ * The phases of a run, in order.
+ *
+ * Emitted on the user channel and carrying no function names or parameters, so
+ * an end-user surface can show honest progress ("choosing what to look up…",
+ * "writing the answer…") without being handed the internals. The trace channel
+ * still carries the detail for an operator.
+ */
+export type RunStage =
+  | 'understanding'
+  | 'selecting'
+  | 'retrieving'
+  | 'composing'
+  | 'done';
+
 export type AgentEvent =
   | { type: 'run.started'; channel: 'user'; runId: string; conversationId: string }
+  | { type: 'stage'; channel: 'user'; stage: RunStage }
   | { type: 'router.decision'; channel: 'trace'; intent: Intent; reason: string }
   | { type: 'catalogue.selected'; channel: 'trace'; functions: string[] }
   | {
       type: 'plan.created';
       channel: 'trace';
       reasoning: string;
-      calls: Array<{ name: string; params: Record<string, unknown> }>;
+      /**
+       * Every function the model was shown, so "was this chosen or was it the
+       * only option" is answerable from the stream. Without it a single-function
+       * plan looks identical to a fallback.
+       */
+      considered: string[];
+      /** True when no model chose this — the planner was unavailable. */
+      isFallback: boolean;
+      calls: Array<{ name: string; params: Record<string, unknown>; reason: string }>;
     }
   | { type: 'function.started'; channel: 'trace'; name: string }
   | {

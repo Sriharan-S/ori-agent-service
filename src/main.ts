@@ -1,14 +1,22 @@
 import 'reflect-metadata';
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { CONFIG, type AppConfig } from './config/configuration';
 import { setupOpenApi } from './api/openapi';
 import { SetupService } from './setup/setup.service';
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    bufferLogs: true,
+  });
   const config = app.get<AppConfig>(CONFIG);
+
+  // A function bundle is bigger than a chat message — ten functions with their
+  // SQL and hints run to a few hundred kilobytes. The 100kb Express default
+  // would reject a real export on the way back in.
+  app.useBodyParser('json', { limit: '2mb' });
 
   app.useGlobalPipes(
     new ValidationPipe({

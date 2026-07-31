@@ -1,6 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { AuditLoggerService } from '../audit/audit-logger.service';
 import type { RequestContext } from '../auth/identity';
+import { CONFIG, type AppConfig } from '../config/configuration';
 import { PrimaryDb, quoteIdent } from '../db/primary.db';
 import {
   ConversationService,
@@ -40,6 +41,7 @@ export class OrchestratorService {
   private readonly logger = new Logger(OrchestratorService.name);
 
   constructor(
+    @Inject(CONFIG) private readonly config: AppConfig,
     private readonly db: PrimaryDb,
     private readonly conversations: ConversationService,
     private readonly registry: RegistryService,
@@ -80,6 +82,8 @@ export class OrchestratorService {
     await this.conversations.appendTurn(conversationKey, 'user', message);
 
     const run: AgentRun = { message, conversationKey, context, history };
+
+    emit({ type: 'stage', channel: 'user', stage: 'understanding' });
     const decision = this.router.classify(message, pending);
 
     emit({
@@ -94,19 +98,27 @@ export class OrchestratorService {
     );
 
     try {
-      const response =
+      // `runTimeoutMs` was documented as the upper bound on a run and enforced
+      // nowhere — the janitor used it to reap stale *records* every five
+      // minutes, which is not the same thing at all. A slow model therefore held
+      // the request open indefinitely: 252 seconds was observed against a real
+      // endpoint, with the SQL itself taking 55ms of it. The caller waits, a
+      // connection stays open, and a pool slot is held the whole time.
+      const response = await this.withDeadline(
         decision.intent === 'clarification-reply' &&
-        decision.pending &&
-        decision.resolvedCandidate
-          ? await this.handleClarificationReply(
+          decision.pending &&
+          decision.resolvedCandidate
+          ? this.handleClarificationReply(
               run,
               decision.pending,
               decision.resolvedCandidate,
               emit,
             )
           : decision.intent === 'conversational'
-            ? await this.handleConversational(run, emit)
-            : await this.handleDataRequest(run, pending !== null, emit);
+            ? this.handleConversational(run, emit)
+            : this.handleDataRequest(run, pending !== null, emit),
+        context.runId,
+      );
 
       await this.conversations.appendTurn(
         conversationKey,
@@ -137,11 +149,17 @@ export class OrchestratorService {
       this.logger.error(`[${context.runId}] pipeline failed: ${detail}`);
       this.audit.recordRejection(context, `pipeline error: ${detail}`);
 
+      // Someone who has been waiting two minutes is owed a better sentence than
+      // "something went wrong" — the cause is known and it is not their fault.
+      const timedOut = /exceeded the \d+ms limit/.test(detail);
+
       const response: AgentResponse = {
         conversationId: conversationKey,
         runId: context.runId,
         type: 'error',
-        message: ORI_STATIC_FALLBACKS.error,
+        message: timedOut
+          ? ORI_STATIC_FALLBACKS.tooSlow
+          : ORI_STATIC_FALLBACKS.error,
         functionsUsed: [],
         requestId: context.requestId,
       };
@@ -157,6 +175,43 @@ export class OrchestratorService {
       emit({ type: 'error', channel: 'user', message: response.message });
       return response;
     }
+  }
+
+  /**
+   * Bound a run by the configured deadline.
+   *
+   * The losing promise is not cancelled — there is no way to cancel an in-flight
+   * `fetch` that another layer owns, and the provider already has its own
+   * per-request timeout. What this guarantees is that the *caller* is answered:
+   * the request completes, the run record closes, and the pool slot is released,
+   * whatever the model does afterwards. The abandoned work finishes into a void
+   * and is garbage collected.
+   *
+   * The timer is unref'd so a pending deadline cannot hold the process open
+   * during shutdown.
+   */
+  private withDeadline<T>(work: Promise<T>, runId: string): Promise<T> {
+    const limit = this.config.behaviour.runTimeoutMs;
+    if (!Number.isFinite(limit) || limit <= 0) return work;
+
+    let timer: NodeJS.Timeout | undefined;
+
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        this.logger.warn(
+          `[${runId}] abandoned after ${limit}ms — the model did not respond in time`,
+        );
+        reject(
+          new Error(
+            `Run exceeded the ${limit}ms limit. The language model did not ` +
+              'respond in time.',
+          ),
+        );
+      }, limit);
+      timer.unref?.();
+    });
+
+    return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
   }
 
   /**
@@ -243,6 +298,11 @@ export class OrchestratorService {
       functions: catalogue.map((entry) => entry.name),
     });
 
+    // Phase one: the model chooses. It sees the catalogue and the question, and
+    // nothing else — no schema, no rows. Announced separately from retrieval so
+    // a caller can show the two phases as two phases.
+    emit({ type: 'stage', channel: 'user', stage: 'selecting' });
+
     const plan = await this.planner.plan(
       run.message,
       catalogue,
@@ -255,9 +315,12 @@ export class OrchestratorService {
       type: 'plan.created',
       channel: 'trace',
       reasoning: plan.reasoning,
+      considered: catalogue.map((entry) => entry.name),
+      isFallback: plan.isFallback,
       calls: plan.calls.map((call) => ({
         name: call.functionName,
         params: call.params,
+        reason: call.reason,
       })),
     });
 
@@ -281,6 +344,10 @@ export class OrchestratorService {
         requestId: run.context.requestId,
       };
     }
+
+    // Phase two: run what was chosen. The model has no part in this — the SQL
+    // was written by an administrator and validated by Postgres.
+    emit({ type: 'stage', channel: 'user', stage: 'retrieving' });
 
     const outcomes = await this.executor.execute(plan, run, emit);
     return this.respondTo(run, outcomes, emit);
@@ -376,6 +443,10 @@ export class OrchestratorService {
     }
 
     const wroteSomething = await this.didWrite(run, outcomes);
+
+    // Phase three: turn the rows into something a person can read. The model
+    // sees humanised notes here, never the rows themselves — see evidence.ts.
+    emit({ type: 'stage', channel: 'user', stage: 'composing' });
 
     const message = await this.synthesizer.answer(
       run.message,

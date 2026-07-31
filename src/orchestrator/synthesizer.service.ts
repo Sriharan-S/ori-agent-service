@@ -4,6 +4,7 @@ import type { ChatMessage } from '../llm/llm.types';
 import type { Candidate } from '../registry/function.contract';
 import type { ConversationTurn } from '../memory/conversation.service';
 import type { AgentEventSink, CallOutcome } from './orchestrator.types';
+import { presentRecord, presentRecords } from './evidence';
 import {
   ORI_CONVERSATIONAL_PERSONA,
   ORI_STATIC_FALLBACKS,
@@ -59,14 +60,16 @@ export class SynthesizerService {
 ═══ WHAT THE USER ASKED ═══
 ${question}
 ${formatHistory(history)}
-═══ RESULTS (the only facts you may use) ═══
+═══ NOTES: THE ONLY FACTS YOU MAY USE ═══
 ${buildEvidence(outcomes)}`,
       },
       {
         role: 'user',
         content:
-          'Write the answer now. Plain prose or a short markdown list. ' +
-          'Do not mention functions, queries or how the data was retrieved.',
+          'Answer their question now, in your own words, as if you already knew ' +
+          'this. One or two sentences unless more is genuinely needed. Do not ' +
+          'describe the notes, do not list fields, and do not mention where the ' +
+          'information came from.',
       },
     ];
 
@@ -177,8 +180,13 @@ ${formatHistory(history)}`,
 }
 
 /**
- * The results, serialized, each tagged with how it turned out so the model
- * cannot mistake an empty result for a zero or a denial for an absence.
+ * The facts, as readable notes rather than rows.
+ *
+ * Each block is still tagged with how the call turned out, so the model cannot
+ * mistake an empty result for a zero or a denial for an absence. What changed is
+ * the vocabulary: values arrive already humanised by `evidence.ts`, so the model
+ * has no column names to parrot back. See that file for why prompting alone was
+ * not enough.
  */
 function buildEvidence(outcomes: CallOutcome[]): string {
   return outcomes
@@ -186,41 +194,62 @@ function buildEvidence(outcomes: CallOutcome[]): string {
       const { result } = outcome;
 
       switch (result.status) {
-        case 'single':
-          return `Result (one record found):\n${stringify(result.data)}`;
-        case 'list':
-          return (
-            `Result (${result.data.length} of ${result.total} records` +
-            `${result.truncated ? ', more available' : ''}):\n${stringify(result.data)}`
-          );
+        case 'single': {
+          const described = presentRecord(result.data);
+          return described === null
+            ? 'A record was found but it held nothing worth reporting.'
+            : `One record was found:\n${described}`;
+        }
+        case 'list': {
+          if (result.data.length === 0) return 'Nothing was found.';
+          const described = presentRecords(result.data);
+          const count =
+            result.total === result.data.length
+              ? `${result.total} record(s) found`
+              : `${result.data.length} of ${result.total} record(s) shown`;
+          return `${count}:\n${described}`;
+        }
         case 'empty':
-          return `Result: nothing matched ${result.searchedBy}.`;
+          return `Nothing matched ${result.searchedBy}.`;
         case 'denied':
-          return `Result: access denied — ${result.reason}`;
+          return `Access denied — ${result.reason}`;
         case 'error':
-          return `Result: this step failed — ${result.message}`;
+          return `This step failed — ${result.message}`;
         case 'ambiguous':
           // Unreachable: the reflector short-circuits before synthesis.
-          return `Result: several records matched ${result.searchedBy}.`;
+          return `Several records matched ${result.searchedBy}.`;
         default:
-          return 'Result: unavailable.';
+          return 'Unavailable.';
       }
     })
     .join('\n\n');
 }
 
+/**
+ * What to say when the model died but the data is already in hand.
+ *
+ * Deliberately plain and clearly mechanical. It uses the same humanised
+ * presentation as the prompt, so even this degraded path does not emit column
+ * names — but it makes no attempt to sound like prose, because pretending to be
+ * a written answer when nothing wrote it is worse than obviously being a listing.
+ */
 function renderWithoutLlm(outcomes: CallOutcome[]): string {
   const parts: string[] = [];
 
   for (const outcome of outcomes) {
     const { result } = outcome;
+
     if (result.status === 'single') {
-      parts.push(formatRecord(result.data));
-    } else if (result.status === 'list') {
-      parts.push(
-        `${result.total} record${result.total === 1 ? '' : 's'} found:`,
-        ...result.data.slice(0, 20).map((row) => `- ${formatRecord(row)}`),
-      );
+      const described = presentRecord(result.data);
+      if (described) parts.push(`Here is what I have:\n${described}`);
+    } else if (result.status === 'list' && result.data.length > 0) {
+      const described = presentRecords(result.data, 20);
+      if (described) {
+        parts.push(
+          `I found ${result.total} result${result.total === 1 ? '' : 's'}:`,
+          described,
+        );
+      }
     }
   }
 
@@ -238,19 +267,3 @@ function formatHistory(history: ConversationTurn[]): string {
   return `\n═══ RECENT CONVERSATION ═══\n${recent}\n`;
 }
 
-function stringify(value: unknown): string {
-  return JSON.stringify(value, null, 2).slice(0, 6000);
-}
-
-/** One-line summary of a record, for the no-LLM path. */
-function formatRecord(value: unknown): string {
-  if (typeof value !== 'object' || value === null) return String(value);
-
-  const record = value as Record<string, unknown>;
-  const entries = Object.entries(record)
-    .filter(([, entry]) => entry !== null && entry !== undefined)
-    .slice(0, 6)
-    .map(([key, entry]) => `${key}: ${String(entry)}`);
-
-  return entries.length > 0 ? entries.join(', ') : '(empty record)';
-}

@@ -3,6 +3,7 @@ import { CONFIG, type AppConfig } from '../config/configuration';
 import { ReadDb } from '../db/read.db';
 import type { RequestContext } from '../auth/identity';
 import { decideAmbiguity, type ScoredMatch } from './ambiguity';
+import { humaniseEnum, humaniseKey } from '../orchestrator/evidence';
 import type {
   FunctionDefinition,
   FunctionResult,
@@ -290,6 +291,18 @@ function scalar(value: unknown): string {
 }
 
 /** A human-readable description of what was searched for, for empty results. */
+/**
+ * What was searched for, phrased for the person who asked.
+ *
+ * This string is read aloud to users on two paths that never touch the model —
+ * the empty result and the clarifying question — so it has to be readable on its
+ * own. Built from raw parameter names it produced:
+ *
+ *   I couldn't find anything matching session_status "NOT_STARTED".
+ *
+ * which is a database column and an enum constant in a sentence meant for a
+ * candidate. The same humanising the synthesizer's notes get is applied here.
+ */
 function describeSearch(params: Record<string, unknown>): string {
   const parts = Object.entries(params)
     .filter(
@@ -300,7 +313,12 @@ function describeSearch(params: Record<string, unknown>): string {
         key !== 'limit' &&
         key !== 'offset',
     )
-    .map(([key, value]) => `${key} "${String(value)}"`);
+    .map(([key, value]) => {
+      const label = humaniseKey(key).toLowerCase();
+      const rendered =
+        typeof value === 'string' ? humaniseEnum(value) : String(value);
+      return `${label} "${rendered}"`;
+    });
 
   return parts.length > 0 ? parts.join(', ') : 'those details';
 }

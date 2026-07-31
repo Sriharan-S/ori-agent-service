@@ -15,6 +15,7 @@ import { renderSetup } from './setup.js';
 import { views } from './views.js';
 import { functionEditor } from './function-editor.js';
 import { guideView } from './guide.js';
+import { playgroundView } from './playground.js';
 
 export const state = {
   user: null,
@@ -59,6 +60,7 @@ const NAV = [
     title: 'Monitor',
     items: [
       { id: 'overview', label: 'Activity', icon: 'activity' },
+      { id: 'playground', label: 'Playground', icon: 'play' },
       { id: 'conversations', label: 'Conversations', icon: 'chat' },
       { id: 'audit', label: 'Audit log', icon: 'audit' },
     ],
@@ -83,6 +85,7 @@ const NAV = [
 
 const TITLES = {
   overview: 'Activity',
+  playground: 'Playground',
   conversations: 'Conversations',
   audit: 'Audit log',
   functions: 'Functions',
@@ -356,6 +359,7 @@ function themeToggle() {
 
 const PAGES = {
   ...views,
+  playground: () => playgroundView(),
   'function-new': () => functionEditor(null),
   'function-edit': (params) => functionEditor(params.name),
   guide: (params) => guideView(params.section),

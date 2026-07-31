@@ -5,8 +5,37 @@ import type { Intent, RouterDecision } from './orchestrator.types';
 
 const GREETING = /^(hi|hello|hey|yo|good (morning|afternoon|evening))\b/i;
 const THANKS = /^(thanks|thank you|ta|cheers|great|nice|perfect|ok(ay)?)\b[\s!.]*$/i;
-const CAPABILITY =
-  /\b(what can you do|who are you|help me|what do you do|how do you work|your capabilities)\b/i;
+
+/**
+ * "What can you do", in the shapes people actually type it.
+ *
+ * The first version of this required the literal phrase `what can you do`, so
+ * "show me what you can do" and "Tell me what you can do?" both missed — the
+ * words are the same but the auxiliary moves. They fell through to the read
+ * path, where the planner was then obliged to pick a data function for a
+ * question about capabilities, and answered "what can you do" by reciting one
+ * student's registration record.
+ *
+ * Matching is on the parts that do not move: a "can/could you"-style ability
+ * question, or a request to be shown capabilities, in either word order.
+ */
+const CAPABILITY = new RegExp(
+  [
+    // what can you do / what you can do / what do you do / what are you able to do
+    'what\\s+(can|could|do|are)\\s+you\\b',
+    'what\\s+you\\s+can\\b',
+    // show me / tell me / list what you can do
+    '(show|tell|list|explain)\\s+(me\\s+)?(what|which|your)\\b.*\\b(do|help|capabilit|feature|function|support)',
+    // who are you / how do you work / your capabilities
+    'who\\s+are\\s+you\\b',
+    'how\\s+(do|does)\\s+(you|this)\\s+work\\b',
+    'your\\s+capabilit',
+    '\\bhelp\\s+me\\b',
+    // what can I ask you
+    'what\\s+(can|should)\\s+i\\s+(ask|say|do)\\b',
+  ].join('|'),
+  'i',
+);
 
 const WRITE_VERB =
   /\b(update|change|rename|set|edit|modify|correct|fix|delete|remove|deactivate|disable|enable|reset|assign|approve|reject)\b/i;
