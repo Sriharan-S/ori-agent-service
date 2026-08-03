@@ -198,12 +198,13 @@ export class ManagementController {
   async upsertService(
     @Ctx() context: RequestContext,
     @Param('name') name: string,
-    @Body() body: { baseUrl: string },
+    @Body() body: { baseUrl: string; publicBaseUrl?: string | null },
   ) {
     const service = await this.applications.upsertService(
       context.application.id,
       name,
       body.baseUrl,
+      body.publicBaseUrl ?? null,
     );
     return { service };
   }

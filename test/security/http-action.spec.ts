@@ -1,5 +1,6 @@
 import { HttpFunctionRunner } from '../../src/registry/http-function.runner';
 import type { PrimaryDb } from '../../src/db/primary.db';
+import type { ReadDb } from '../../src/db/read.db';
 import type { RequestContext } from '../../src/auth/identity';
 import type {
   FunctionDefinition,
@@ -7,12 +8,23 @@ import type {
 } from '../../src/registry/function.contract';
 import { loadConfiguration } from '../../src/config/configuration';
 
-const services = [{ name: 'core', base_url: 'https://api.internal.test/v1/' }];
+const services = [
+  {
+    name: 'core',
+    base_url: 'https://api.internal.test/v1/',
+    public_base_url: null,
+  },
+];
 
 const db = {
   schema: 'ori',
   query: () => Promise.resolve(services),
 } as unknown as PrimaryDb;
+
+/** Only reached by functions that declare a precondition. */
+const readDb = {
+  query: () => Promise.resolve({ rows: [{ ok: 1 }], fields: ['ok'] }),
+} as unknown as ReadDb;
 
 function context(): RequestContext {
   return {
@@ -82,7 +94,7 @@ function definition(httpRequest: HttpRequestSpec): FunctionDefinition {
 }
 
 describe('HTTP action targeting', () => {
-  const runner = new HttpFunctionRunner(loadConfiguration(), db);
+  const runner = new HttpFunctionRunner(loadConfiguration(), db, readDb);
   let fetchMock: jest.SpyInstance;
 
   beforeEach(() => {

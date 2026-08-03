@@ -20,6 +20,12 @@ export interface ServiceEntry {
   id: number;
   name: string;
   baseUrl: string;
+  /**
+   * Where links handed back to a person point, when that is not where the agent
+   * calls — an internal hostname is reachable from the service and useless in a
+   * browser. Null means the two are the same.
+   */
+  publicBaseUrl: string | null;
 }
 
 interface ApplicationRow {
@@ -123,8 +129,9 @@ export class ApplicationService {
       id: string;
       name: string;
       base_url: string;
+      public_base_url: string | null;
     }>(
-      `SELECT id, name, base_url FROM ${this.schema}.agent_services
+      `SELECT id, name, base_url, public_base_url FROM ${this.schema}.agent_services
         WHERE application_id = $1 ORDER BY name`,
       [applicationId],
     );
@@ -133,34 +140,50 @@ export class ApplicationService {
       id: Number(row.id),
       name: row.name,
       baseUrl: row.base_url,
+      publicBaseUrl: row.public_base_url,
     }));
   }
 
+  /**
+   * @param publicBaseUrl Where a link handed to a person should point, when
+   *   that differs from where the agent calls. Null means they are the same.
+   */
   async upsertService(
     applicationId: number,
     name: string,
     baseUrl: string,
+    publicBaseUrl?: string | null,
   ): Promise<ServiceEntry> {
     // Parsed rather than pattern-matched, so a malformed base URL is rejected
     // here rather than at the first action that uses it.
-    const parsed = new URL(baseUrl);
-    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-      throw new Error('Service base URL must be http or https');
-    }
+    const parsed = parseBaseUrl(baseUrl, 'Service base URL');
+    const parsedPublic =
+      publicBaseUrl && publicBaseUrl.trim() !== ''
+        ? parseBaseUrl(publicBaseUrl, 'Public base URL')
+        : null;
 
-    const row = await this.db.one<{ id: string; name: string; base_url: string }>(
-      `INSERT INTO ${this.schema}.agent_services (application_id, name, base_url)
-       VALUES ($1, $2, $3)
+    const row = await this.db.one<{
+      id: string;
+      name: string;
+      base_url: string;
+      public_base_url: string | null;
+    }>(
+      `INSERT INTO ${this.schema}.agent_services
+         (application_id, name, base_url, public_base_url)
+       VALUES ($1, $2, $3, $4)
        ON CONFLICT (application_id, name) DO UPDATE
-         SET base_url = EXCLUDED.base_url, updated_at = now()
-       RETURNING id, name, base_url`,
-      [applicationId, name, parsed.toString()],
+         SET base_url = EXCLUDED.base_url,
+             public_base_url = EXCLUDED.public_base_url,
+             updated_at = now()
+       RETURNING id, name, base_url, public_base_url`,
+      [applicationId, name, parsed, parsedPublic],
     );
 
     return {
       id: Number(row!.id),
       name: row!.name,
       baseUrl: row!.base_url,
+      publicBaseUrl: row!.public_base_url,
     };
   }
 
@@ -170,6 +193,22 @@ export class ApplicationService {
       [applicationId, name],
     );
   }
+}
+
+/** A base URL the service will later resolve paths against, checked once here. */
+function parseBaseUrl(value: string, label: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${label} is not a valid URL`);
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error(`${label} must be http or https`);
+  }
+
+  return parsed.toString();
 }
 
 function toApplication(

@@ -4,7 +4,11 @@ import {
   type AuditStatus,
 } from '../audit/audit-logger.service';
 import { RoleService } from '../auth/role.service';
-import type { FunctionDefinition, FunctionResult } from '../registry/function.contract';
+import type {
+  FunctionDefinition,
+  FunctionResult,
+  ResultArtifact,
+} from '../registry/function.contract';
 import { HttpFunctionRunner } from '../registry/http-function.runner';
 import { ParamValidatorService } from '../registry/param-validator.service';
 import { RegistryService } from '../registry/registry.service';
@@ -200,6 +204,7 @@ export class ExecutorService {
     let result: FunctionResult;
     let scopesApplied: Record<string, string | number> = {};
     let afterState: Record<string, unknown> | undefined;
+    let artifacts: ResultArtifact[] | undefined;
     let rowCount = 0;
 
     try {
@@ -212,6 +217,8 @@ export class ExecutorService {
         const outcome = await this.http.run(definition, validation.params, context);
         result = outcome.result;
         afterState = outcome.afterState;
+        artifacts = outcome.artifacts;
+        scopesApplied = outcome.scopesApplied ?? {};
         rowCount = result.status === 'single' ? 1 : 0;
       }
     } catch (error) {
@@ -255,12 +262,20 @@ export class ExecutorService {
       latencyMs: durationMs,
     });
 
+    // Artifacts are announced on the user channel as soon as they exist, so a
+    // client can render a real link rather than waiting for the answer text and
+    // hoping the URL survived being written.
+    for (const artifact of artifacts ?? []) {
+      emit({ type: 'artifact', channel: 'user', ...artifact });
+    }
+
     return {
       functionName: definition.name,
       functionVersion: definition.version,
       params: validation.params,
       result,
       durationMs,
+      ...(artifacts && artifacts.length > 0 ? { artifacts } : {}),
     };
   }
 

@@ -120,6 +120,10 @@ views.functions = async () => {
   const { functions } = await api(appPath('/functions'));
   const hasDemo = functions.some((fn) => fn.name === 'demo');
   const live = functions.filter((fn) => fn.status === 'live').length;
+  const liveBeyondDemo = functions.filter(
+    (fn) => fn.status === 'live' && fn.name !== 'demo').length;
+  const pending = functions.filter(
+    (fn) => fn.status === 'draft' || fn.status === 'approved');
 
   return frag(
     pageHead('Functions',
@@ -144,7 +148,19 @@ views.functions = async () => {
     live === 0 && functions.length > 0 ? banner('warn',
       frag(el('strong', {}, 'Nothing is live. '),
         'Only live functions are visible to the planner, so the agent currently ' +
-        'has nothing it can do. Approve a function, then take it live.')) : null,
+        'has nothing it can do. Approve a function, then take it live.'),
+      pending.length ? releaseAllButton(pending) : null) : null,
+
+    // The demo function being live is not the same as having a registry. An
+    // import leaves everything as a draft, so this is the state right after
+    // one: plenty of functions, none of them reachable, and the planner falling
+    // back to the only thing it can see.
+    live > 0 && liveBeyondDemo === 0 && pending.length > 0 ? banner('warn',
+      frag(el('strong', {}, `${pending.length} function(s) are waiting to go live. `),
+        'Only the demo function is live, so that is the only thing the planner can ' +
+        'choose — which is why the agent answers about database tables instead of ' +
+        'your data. Approve them and take them live.'),
+      releaseAllButton(pending)) : null,
 
     panel('Registry', { count: functions.length },
       functions.length === 0
@@ -631,16 +647,135 @@ views.applications = async () => {
 
     panel('Registered services', {
       count: services.length,
-      foot: 'A write action names a service registered here, never a URL of its own — otherwise anyone who could author a function could make this service call an internal address.',
+      tools: [button('Register service', { variant: 'primary', iconName: 'link', onclick: () => editService(null) })],
+      foot: 'A write action names a service registered here, never a URL of its own — otherwise anyone who could author a function could make this service call an internal address. Links an action hands back to a person are rebuilt against the public URL, when one is set.',
     },
       services.length === 0
         ? empty('No services registered',
             'Write functions call back into your API. Until a service is registered, ' +
-            'there is nowhere for a write action to go.', null, 'link')
-        : table(['Name', 'Base URL'],
-            services.map((service) => [service.name, el('span', { class: 'mono' }, service.baseUrl)]))),
+            'there is nowhere for a write action to go.',
+            button('Register a service', { variant: 'primary', onclick: () => editService(null) }),
+            'link')
+        : table(['Name', 'Base URL (the agent calls)', 'Public URL (people open)', ''],
+            services.map((service) => [
+              el('button', { class: 'linkish', type: 'button', onclick: () => editService(service) },
+                service.name),
+              el('span', { class: 'mono' }, service.baseUrl),
+              service.publicBaseUrl
+                ? el('span', { class: 'mono' }, service.publicBaseUrl)
+                : el('span', { class: 'muted' }, 'same as base'),
+              el('div', { class: 'cell-actions' },
+                button('Remove', {
+                  variant: 'danger',
+                  size: 'sm',
+                  onclick: async () => {
+                    if (!confirm(`Remove "${service.name}"? Any action naming it stops working immediately.`)) return;
+                    await api(appPath(`/services/${encodeURIComponent(service.name)}`), { method: 'DELETE' });
+                    render();
+                  },
+                })),
+            ]))),
   );
 };
+
+/**
+ * Register or edit an action target.
+ *
+ * Two URLs, because they answer different questions. `baseUrl` is where this
+ * service sends requests — often an internal address. `publicBaseUrl` is where
+ * a link in an answer should point, which has to work in someone's browser.
+ * Leaving the second blank means they are the same, which is the common case.
+ */
+/**
+ * Approve and take live everything that is waiting.
+ *
+ * An import leaves 25 functions as drafts, and clicking through two promotions
+ * each is not review — it is 50 clicks nobody reads by the tenth. This walks the
+ * same two endpoints one function at a time, so each still re-validates against
+ * the database on the way live and a function that no longer plans still stops.
+ *
+ * Failures are collected rather than aborting the run: one broken function
+ * should not leave the other twenty-four stranded as drafts.
+ */
+function releaseAllButton(pending) {
+  return button(`Approve and take all ${pending.length} live`, {
+    variant: 'primary',
+    iconName: 'check',
+    onclick: async (event) => {
+      const trigger = event.currentTarget;
+      trigger.disabled = true;
+
+      const failed = [];
+      let released = 0;
+
+      for (const fn of pending) {
+        const path = appPath(`/functions/${encodeURIComponent(fn.name)}/status`);
+        try {
+          if (fn.status === 'draft') {
+            await api(path, { method: 'POST', body: { status: 'approved' } });
+          }
+          await api(path, { method: 'POST', body: { status: 'live' } });
+          released += 1;
+        } catch (error) {
+          failed.push(`${fn.name}: ${error.message}`);
+        }
+        trigger.textContent = `Releasing… ${released + failed.length} of ${pending.length}`;
+      }
+
+      if (failed.length === 0) {
+        toast(`${released} function(s) are live.`, 'ok');
+      } else {
+        toast(`${released} live, ${failed.length} refused. See the list.`, 'warn');
+        openModal('These could not go live', frag(
+          el('p', { class: 'muted' },
+            'Each was re-validated against the database on the way. Fix and retry ' +
+            'individually — the rest are already live.'),
+          codeBlock(failed.join('\n\n'), { wrap: true }),
+        ));
+      }
+
+      render();
+    },
+  });
+}
+
+function editService(existing) {
+  const name = textInput(existing?.name ?? '', { placeholder: 'reports' });
+  const baseUrl = textInput(existing?.baseUrl ?? '', { placeholder: 'http://localhost:3001/' });
+  const publicBaseUrl = textInput(existing?.publicBaseUrl ?? '', { placeholder: 'https://app.example.com/' });
+  if (existing) name.disabled = true;
+
+  const save = button('Save', {
+    variant: 'primary',
+    onclick: async () => {
+      const key = name.value.trim();
+      if (!key) { toast('Name the service.', 'bad'); return; }
+      try {
+        await api(appPath(`/services/${encodeURIComponent(key)}`), {
+          method: 'PUT',
+          body: { baseUrl: baseUrl.value.trim(), publicBaseUrl: publicBaseUrl.value.trim() || null },
+        });
+        closeModal();
+        render();
+      } catch (error) {
+        toast(error.message, 'bad');
+      }
+    },
+  });
+
+  openModal(existing ? `Service · ${existing.name}` : 'Register a service', frag(
+    field('Name', name,
+      'What an action names in its <code>service</code> field. Lower case, no spaces.'),
+    field('Base URL', baseUrl,
+      'Where this service sends the request. Reachable from wherever the agent runs — ' +
+      'an internal hostname or container name is fine here.'),
+    field('Public base URL', publicBaseUrl,
+      'Where a link handed back to a person should point. Leave blank when the base URL ' +
+      'is already something a browser can open.', { optional: true }),
+    el('div', { class: 'btnrow btnrow--end', style: 'margin-top:14px' },
+      button('Cancel', { onclick: closeModal }), save),
+  ));
+}
 
 function editApplication(existing) {
   const name = textInput(existing?.name ?? '', { placeholder: 'Acme Support Portal' });
@@ -778,14 +913,33 @@ views.conversations = async () => {
 
 async function showTranscript(key) {
   const { messages } = await api(`/conversations/${key}`);
+  const superseded = messages.filter((message) => message.supersededAt).length;
 
   openModal('Transcript', frag(
+    // A turn the user edited away is still part of what happened, and it is
+    // often the explanation for an answer that otherwise reads as a non
+    // sequitur. Shown, dimmed, in place.
+    superseded
+      ? notice(
+          `${superseded} turn(s) were replaced when someone edited an earlier message. ` +
+          'The agent no longer reads them; they are shown here dimmed, in the order they happened.',
+          'info')
+      : null,
+
     ...messages.map((message) =>
-      el('div', { class: 'card', style: 'padding:12px 14px;margin-bottom:10px' },
+      el('div', {
+        class: 'card',
+        style: 'padding:12px 14px;margin-bottom:10px' +
+          (message.supersededAt ? ';opacity:.55;border-style:dashed' : ''),
+      },
         el('div', { style: 'display:flex;gap:8px;align-items:center;margin-bottom:6px' },
           badge(message.role, message.role === 'user' ? 'info' : ''),
-          el('span', { class: 'faint', style: 'font-size:11.5px' }, fmt.time(message.createdAt))),
-        el('div', { style: 'font-size:13.5px;line-height:1.6;white-space:pre-wrap' }, message.content))),
+          el('span', { class: 'faint', style: 'font-size:11.5px' }, fmt.time(message.createdAt)),
+          message.supersededAt ? badge('replaced', 'warn') : null),
+        el('div', {
+          style: 'font-size:13.5px;line-height:1.6;white-space:pre-wrap' +
+            (message.supersededAt ? ';text-decoration:line-through' : ''),
+        }, message.content))),
   ), { wide: true });
 }
 

@@ -1,5 +1,9 @@
 import type { RequestContext } from '../auth/identity';
-import type { Candidate, FunctionResult } from '../registry/function.contract';
+import type {
+  Candidate,
+  FunctionResult,
+  ResultArtifact,
+} from '../registry/function.contract';
 import type {
   ConversationTurn,
   PendingDisambiguation,
@@ -41,6 +45,12 @@ export interface CallOutcome {
   params: Record<string, unknown>;
   result: FunctionResult;
   durationMs: number;
+  /**
+   * Values that must reach the user unaltered — a download link, a one-time
+   * password. Deliberately kept off the evidence the model is shown: they are
+   * appended to the answer verbatim instead of being described.
+   */
+  artifacts?: ResultArtifact[];
 }
 
 export type AgentResponseType =
@@ -57,6 +67,15 @@ export interface AgentResponse {
   candidates?: Candidate[];
   functionsUsed: string[];
   requestId: string;
+  /**
+   * Ids of the two turns this run recorded.
+   *
+   * A client that lets someone edit an earlier message needs a handle on it,
+   * and the only stable one is the id the message was stored under. Null when
+   * the turn could not be recorded — observability never fails a request here.
+   */
+  userMessageId?: number | null;
+  assistantMessageId?: number | null;
 }
 
 export interface AgentRun {
@@ -96,6 +115,18 @@ export type RunStage =
 export type AgentEvent =
   | { type: 'run.started'; channel: 'user'; runId: string; conversationId: string }
   | { type: 'stage'; channel: 'user'; stage: RunStage }
+  /**
+   * A turn was written to the transcript, with the id it was written under.
+   *
+   * On the user channel because it carries no reasoning — just the handle a
+   * client needs to say "edit this one and continue from there".
+   */
+  | {
+      type: 'turn.recorded';
+      channel: 'user';
+      role: 'user' | 'assistant';
+      messageId: number;
+    }
   | { type: 'router.decision'; channel: 'trace'; intent: Intent; reason: string }
   | { type: 'catalogue.selected'; channel: 'trace'; functions: string[] }
   | {
@@ -123,6 +154,13 @@ export type AgentEvent =
     }
   | { type: 'reflection'; channel: 'trace'; action: string }
   | { type: 'message.delta'; channel: 'user'; text: string }
+  /**
+   * Something an action produced that the user needs exactly as it is: a link
+   * to open, or a value to copy. Sent as its own event so a client can render a
+   * button, and never routed through the model, which cannot be relied on to
+   * reproduce a long URL character for character.
+   */
+  | ({ type: 'artifact'; channel: 'user' } & ResultArtifact)
   | {
       type: 'clarification';
       channel: 'user';

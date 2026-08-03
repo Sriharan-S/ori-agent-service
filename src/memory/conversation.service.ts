@@ -86,16 +86,18 @@ export class ConversationService {
     return key;
   }
 
+  /** Returns the new message's id, so a client can later address this turn. */
   async appendTurn(
     conversationKey: string,
     role: 'user' | 'assistant',
     content: string,
     metadata: Record<string, unknown> = {},
-  ): Promise<void> {
-    await this.db.query(
+  ): Promise<number | null> {
+    const inserted = await this.db.one<{ id: string | number }>(
       `INSERT INTO ${this.schema}.agent_messages (conversation_id, role, content, metadata)
        SELECT id, $2, $3, $4::jsonb FROM ${this.schema}.agent_conversations
-        WHERE conversation_key = $1`,
+        WHERE conversation_key = $1
+       RETURNING id`,
       [conversationKey, role, content, JSON.stringify(metadata)],
     );
 
@@ -109,15 +111,89 @@ export class ConversationService {
         WHERE conversation_key = $1`,
       [conversationKey, role, content],
     );
+
+    return inserted ? Number(inserted.id) : null;
   }
 
-  /** Recent turns, oldest first, for the planner and synthesizer prompts. */
+  /**
+   * Discard a turn and everything after it.
+   *
+   * This is what "edit that message and continue from there" means on the
+   * server. The rows are marked rather than removed — see migration
+   * `0007_message_supersede` — so the agent stops reading them while an
+   * operator can still see the branch that was abandoned.
+   *
+   * Ownership is checked the same way `resolve` checks it, and for the same
+   * reason: a message id is a small integer, and without the join on
+   * (application, end user) anyone could rewind anyone's conversation.
+   *
+   * The pending disambiguation is cleared unconditionally. It belongs to the
+   * discarded branch, and a "the second one" answered against a question that
+   * no longer exists is worse than no pending state at all.
+   */
+  async supersedeFrom(
+    conversationKey: string,
+    messageId: number,
+    context: RequestContext,
+  ): Promise<{ removed: number }> {
+    const rows = await this.db.query<{ id: string | number }>(
+      `UPDATE ${this.schema}.agent_messages m
+          SET superseded_at = now()
+         FROM ${this.schema}.agent_conversations c
+        WHERE m.conversation_id = c.id
+          AND c.conversation_key = $1
+          AND c.application_id   = $2
+          AND c.end_user_id      = $3
+          AND m.superseded_at IS NULL
+          -- Ordered by (created_at, id) everywhere else, so "at or after" is
+          -- expressed the same way here rather than by id alone.
+          AND (m.created_at, m.id) >= (
+                SELECT m2.created_at, m2.id
+                  FROM ${this.schema}.agent_messages m2
+                 WHERE m2.id = $4 AND m2.conversation_id = c.id)
+        RETURNING m.id`,
+      [
+        conversationKey,
+        context.application.id,
+        context.endUser.id,
+        messageId,
+      ],
+    );
+
+    if (rows.length === 0) {
+      // Either the message is not in this conversation, the conversation is not
+      // this caller's, or it was already superseded. None of those is worth
+      // distinguishing to the caller — the turn is simply not theirs to rewind.
+      this.logger.warn(
+        `Rewind of ${conversationKey} to message ${messageId} by ${context.endUser.id} matched nothing`,
+      );
+      return { removed: 0 };
+    }
+
+    await this.db.query(
+      `UPDATE ${this.schema}.agent_conversations
+          SET message_count = GREATEST(message_count - $2, 0),
+              pending_state = NULL,
+              updated_at = now()
+        WHERE conversation_key = $1`,
+      [conversationKey, rows.length],
+    );
+
+    this.logger.log(
+      `Rewound ${conversationKey} to message ${messageId}: ${rows.length} turn(s) superseded`,
+    );
+
+    return { removed: rows.length };
+  }
+
+  /** Recent live turns, oldest first, for the planner and synthesizer prompts. */
   async getHistory(conversationKey: string): Promise<ConversationTurn[]> {
     const rows = await this.db.query<{ role: string; content: string }>(
       `SELECT m.role, m.content
          FROM ${this.schema}.agent_messages m
          JOIN ${this.schema}.agent_conversations c ON c.id = m.conversation_id
         WHERE c.conversation_key = $1
+          AND m.superseded_at IS NULL
         ORDER BY m.created_at DESC, m.id DESC
         LIMIT $2`,
       [conversationKey, HISTORY_TURNS],
@@ -203,16 +279,33 @@ export class ConversationService {
     }));
   }
 
+  /**
+   * The whole conversation, superseded turns included and marked as such.
+   *
+   * The console is the one place that wants the abandoned branch: "why did the
+   * agent answer that" is often answered by a question the user withdrew.
+   */
   async getTranscript(
     conversationKey: string,
-  ): Promise<Array<ConversationTurn & { createdAt: Date; metadata: unknown }>> {
+  ): Promise<
+    Array<
+      ConversationTurn & {
+        id: number;
+        createdAt: Date;
+        metadata: unknown;
+        supersededAt: Date | null;
+      }
+    >
+  > {
     const rows = await this.db.query<{
+      id: string | number;
       role: string;
       content: string;
       metadata: unknown;
       created_at: Date;
+      superseded_at: Date | null;
     }>(
-      `SELECT m.role, m.content, m.metadata, m.created_at
+      `SELECT m.id, m.role, m.content, m.metadata, m.created_at, m.superseded_at
          FROM ${this.schema}.agent_messages m
          JOIN ${this.schema}.agent_conversations c ON c.id = m.conversation_id
         WHERE c.conversation_key = $1
@@ -221,10 +314,12 @@ export class ConversationService {
     );
 
     return rows.map((row) => ({
+      id: Number(row.id),
       role: row.role === 'assistant' ? 'assistant' : 'user',
       content: row.content,
       metadata: row.metadata,
       createdAt: row.created_at,
+      supersededAt: row.superseded_at,
     }));
   }
 }

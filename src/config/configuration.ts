@@ -85,6 +85,15 @@ export interface AppConfig {
     timeoutMs: number;
     /** Extra hostnames allowed as action targets beyond registered services. */
     allowedHosts: string[];
+    /**
+     * Ceiling on waiting for a host application's background job, whatever a
+     * function's own interval and attempt count add up to. A caller is waiting
+     * on the other end of this, and a job that has not finished by now is
+     * better reported as still running than held open.
+     */
+    pollMaxMs: number;
+    /** Floor on a function's poll interval, so a tight loop cannot be authored. */
+    pollMinIntervalMs: number;
   };
 }
 
@@ -193,6 +202,8 @@ export function loadConfiguration(): AppConfig {
     outbound: {
       timeoutMs: num(env.OUTBOUND_TIMEOUT_MS, 10000),
       allowedHosts: list(env.OUTBOUND_ALLOWED_HOSTS),
+      pollMaxMs: num(env.OUTBOUND_POLL_MAX_MS, 60000),
+      pollMinIntervalMs: num(env.OUTBOUND_POLL_MIN_INTERVAL_MS, 500),
     },
   };
 }

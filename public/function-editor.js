@@ -360,7 +360,33 @@ function writeSectionBody(inputs) {
       '<code>service</code> names a service registered on the Applications page — never a ' +
       'URL, so a saved function cannot make this server call an internal address. Path values ' +
       'are URL-encoded, redirects are not followed, and any Authorization or Cookie header ' +
-      'in the body is dropped.'),
+      'in the body is dropped.<br><br>' +
+
+      'A path or body may also use <code>{{scope:key}}</code>, which binds the caller\'s own ' +
+      'scope value — that is how a self-service action reaches "my" record without accepting ' +
+      'an id it would have to trust. A role exempt from that key is refused, because ' +
+      '"every value" is not an identifier.<br><br>' +
+
+      '<strong>precondition</strong> — <code>{"precondition":{"sqlTemplate":"SELECT 1 FROM ' +
+      'orders o WHERE o.id = {{param:id}} AND {{scope:org_id}}","denyMessage":"Not your order."}}</code>. ' +
+      'A read that must return a row before the call goes out. An HTTP action carries no WHERE ' +
+      'clause, so without this the only thing keeping it inside the caller\'s tenant is the ' +
+      'target API\'s own checks. Compiled by the same engine as a read function, so an ' +
+      'unbindable scope refuses the action.<br><br>' +
+
+      '<strong>poll</strong> — <code>{"poll":{"urlFrom":"statusUrl","statusField":"status",' +
+      '"successWhen":["COMPLETED"],"failureWhen":["ERROR"],"intervalMs":2000,"maxAttempts":30}}</code>. ' +
+      'For an API that accepts work and finishes it in the background: the agent follows the ' +
+      'job and answers with the finished thing rather than a job id. The follow-up URL comes ' +
+      'out of a response body, so it is re-checked against the registered service — a host ' +
+      'that names somewhere else is not followed.<br><br>' +
+
+      '<strong>result</strong> — <code>{"result":{"link":{"from":"downloadUrl","label":"Download report"},' +
+      '"expose":[{"from":"password","label":"Password"}]}}</code>. ' +
+      'Values that must reach the user exactly as they are. These bypass the model entirely — ' +
+      'it is told a link is coming but never shown it, because a model asked to repeat a long ' +
+      'URL will eventually change a character. Links are rebuilt against the service\'s public ' +
+      'base URL. <code>expose</code> hands a value over verbatim, so declare one field at a time.'),
 
     field('Write scope', inputs.writeScope,
       'The permission label checked against the caller\'s role. A role must list this in its ' +

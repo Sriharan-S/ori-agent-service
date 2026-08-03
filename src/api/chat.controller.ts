@@ -70,6 +70,8 @@ export class ChatController {
       body.message,
       body.conversationId ?? null,
       context,
+      undefined,
+      { replaceFromMessageId: body.replaceFromMessageId ?? null },
     );
 
     return {
@@ -80,6 +82,8 @@ export class ChatController {
       ...(response.candidates ? { candidates: response.candidates } : {}),
       functionsUsed: response.functionsUsed,
       requestId: response.requestId,
+      userMessageId: response.userMessageId ?? null,
+      assistantMessageId: response.assistantMessageId ?? null,
     };
   }
 
@@ -96,8 +100,13 @@ export class ChatController {
     description: [
       'Server-Sent Events, one JSON event per frame with `event:` naming the type.',
       '',
-      '**User channel** (always sent): `run.started`, `message.delta`,',
-      '`clarification`, `run.completed`, `error`.',
+      '**User channel** (always sent): `run.started`, `turn.recorded`,',
+      '`message.delta`, `clarification`, `run.completed`, `error`.',
+      '',
+      '`turn.recorded` carries the id each turn was stored under. Keep the id of',
+      'a user turn to let someone edit it later: resend with',
+      '`replaceFromMessageId` set to it and that turn, along with everything',
+      'after it, is discarded before the run reads the history.',
       '',
       '**Trace channel** (only when the key holds the `trace` scope *and* the',
       'request sets `trace: true`): `router.decision`, `catalogue.selected`,',
@@ -151,6 +160,7 @@ export class ChatController {
         body.conversationId ?? null,
         context,
         send,
+        { replaceFromMessageId: body.replaceFromMessageId ?? null },
       );
     } catch (error) {
       // The orchestrator handles its own failures; this is the last resort.

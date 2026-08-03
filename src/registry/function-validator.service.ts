@@ -76,6 +76,16 @@ export class FunctionValidatorService {
 
     if (draft.kind === 'write') {
       issues.push(...this.checkHttpRequest(draft));
+
+      // The precondition is real SQL and gets the same treatment as a read
+      // function's body: Postgres decides whether it is valid, not a regex.
+      // Skipped once the shape is already wrong, so an author sees the
+      // structural problem rather than a parse error caused by it.
+      const guard = draft.httpRequest?.precondition;
+      if (guard && !issues.some((issue) => issue.severity === 'error')) {
+        issues.push(...(await this.checkPreconditionSql(draft, guard.sqlTemplate)));
+      }
+
       return { ok: !issues.some((i) => i.severity === 'error'), issues };
     }
 
@@ -171,12 +181,23 @@ export class FunctionValidatorService {
       const hasResolved = Object.values(draft.parameters).some(
         (param) => param.resolvedIdentifier,
       );
-      if (!hasResolved) {
+      // An action must act on something it did not have to guess. Two ways to
+      // satisfy that: an id a lookup produced, or the caller's own proven scope
+      // — "generate *my* report" takes no identifier at all, and demanding one
+      // would force a self-service action to accept a user id as a parameter,
+      // which is strictly worse.
+      const boundToScope =
+        SCOPE_TOKEN_PATTERN.test(draft.httpRequest?.path ?? '') ||
+        SCOPE_TOKEN_PATTERN.test(JSON.stringify(draft.httpRequest?.body ?? null)) ||
+        Boolean(draft.httpRequest?.precondition);
+
+      if (!hasResolved && !boundToScope) {
         issues.push({
           severity: 'error',
           message:
-            'A write function must take at least one resolvedIdentifier parameter. ' +
-            'Actions act on ids that a lookup produced, never on names.',
+            'A write function must either take a resolvedIdentifier parameter or bind the ' +
+            "caller's scope — with a {{scope:key}} token or a precondition. Actions act on " +
+            'ids a lookup produced or on the caller\'s own records, never on names.',
         });
       }
     } else if (draft.writeScope) {
@@ -217,6 +238,10 @@ export class FunctionValidatorService {
         { severity: 'error', message: 'A write function needs an HTTP action.' },
       ];
     }
+
+    issues.push(...this.checkScopeTokens(draft, spec));
+    issues.push(...this.checkPoll(spec));
+    issues.push(...this.checkResult(spec));
 
     if (!spec.service || !/^[a-z][a-z0-9_-]*$/i.test(spec.service)) {
       issues.push({
@@ -267,6 +292,193 @@ export class FunctionValidatorService {
     }
 
     return issues;
+  }
+
+  /** Every {{scope:key}} in a path or body must be a key the function declares. */
+  private checkScopeTokens(
+    draft: FunctionDraft,
+    spec: HttpRequestSpec,
+  ): ValidationIssue[] {
+    const issues: ValidationIssue[] = [];
+    const declared = new Set(draft.scopeFilters.map((filter) => filter.key));
+    const used = new Set([
+      ...collectScopeNames(spec.path),
+      ...collectScopeNames(JSON.stringify(spec.body ?? null)),
+      ...collectScopeNames(spec.precondition?.sqlTemplate ?? ''),
+    ]);
+
+    for (const key of used) {
+      if (!declared.has(key)) {
+        issues.push({
+          severity: 'error',
+          message:
+            `{{scope:${key}}} is used but no scope filter declares "${key}". ` +
+            'A scope the engine cannot resolve refuses the action at run time.',
+        });
+      }
+    }
+
+    for (const key of declared) {
+      if (!used.has(key)) {
+        issues.push({
+          severity: 'error',
+          message:
+            `Scope filter "${key}" is declared but {{scope:${key}}} appears nowhere in the ` +
+            'action or its precondition. A declared scope that is not applied reads as ' +
+            'protected and is not.',
+        });
+      }
+    }
+
+    return issues;
+  }
+
+  private checkPoll(spec: HttpRequestSpec): ValidationIssue[] {
+    const poll = spec.poll;
+    if (!poll) return [];
+
+    const issues: ValidationIssue[] = [];
+
+    if (!poll.urlFrom && !poll.path) {
+      issues.push({
+        severity: 'error',
+        message:
+          'A poll needs either urlFrom — the response field holding the follow-up URL — ' +
+          'or path, a template built from the response.',
+      });
+    }
+
+    if (!poll.statusField) {
+      issues.push({
+        severity: 'error',
+        message: 'A poll needs statusField, naming the field that says whether the job is done.',
+      });
+    }
+
+    if (!Array.isArray(poll.successWhen) || poll.successWhen.length === 0) {
+      issues.push({
+        severity: 'error',
+        message:
+          'A poll needs successWhen: the status values that mean the job finished. ' +
+          'Without one it can only ever time out.',
+      });
+    }
+
+    if (poll.path && /^https?:\/\//i.test(poll.path)) {
+      issues.push({
+        severity: 'error',
+        message: 'A poll path must be relative to the service, not an absolute URL.',
+      });
+    }
+
+    const overlap = (poll.failureWhen ?? []).filter((value) =>
+      (poll.successWhen ?? []).includes(value),
+    );
+    if (overlap.length > 0) {
+      issues.push({
+        severity: 'error',
+        message: `Status "${overlap.join('", "')}" is listed as both success and failure.`,
+      });
+    }
+
+    if ((poll.maxAttempts ?? 20) * (poll.intervalMs ?? 2000) > 300_000) {
+      issues.push({
+        severity: 'warning',
+        message:
+          'This poll could run for over five minutes on paper. The service-wide ceiling ' +
+          'stops it long before that, so the later attempts will never happen.',
+      });
+    }
+
+    return issues;
+  }
+
+  private checkResult(spec: HttpRequestSpec): ValidationIssue[] {
+    const result = spec.result;
+    if (!result) return [];
+
+    const issues: ValidationIssue[] = [];
+
+    if (result.link && !result.link.from) {
+      issues.push({
+        severity: 'error',
+        message: 'A result link needs "from", naming the response field that holds the URL.',
+      });
+    }
+
+    for (const field of result.expose ?? []) {
+      if (!field.from) {
+        issues.push({
+          severity: 'error',
+          message: 'Every exposed field needs "from", naming the response field to read.',
+        });
+      }
+    }
+
+    if ((result.expose ?? []).length > 0) {
+      issues.push({
+        severity: 'warning',
+        message:
+          'Exposed fields are handed to the caller verbatim. They bypass the model, so they ' +
+          'are never paraphrased — but whoever can call this function will see them. ' +
+          'Expose one field at a time and only what the answer genuinely needs.',
+      });
+    }
+
+    return issues;
+  }
+
+  /**
+   * The scope guard, handed to Postgres.
+   *
+   * Only the scope keys the guard itself uses are bound, because a function may
+   * declare a key that its path uses and its guard does not — the combined
+   * usage is checked separately in `checkScopeTokens`.
+   */
+  private async checkPreconditionSql(
+    draft: FunctionDraft,
+    template: string,
+  ): Promise<ValidationIssue[]> {
+    const used = new Set(collectScopeNames(template));
+    const filters = draft.scopeFilters.filter((filter) => used.has(filter.key));
+
+    let compiled;
+    try {
+      compiled = compileSqlTemplate({
+        template,
+        params: sampleParams(draft.parameters),
+        scopeFilters: filters,
+        scopeValues: Object.fromEntries(filters.map((f) => [f.key, 1])),
+        unscopedKeys: [],
+      });
+    } catch (error) {
+      return [
+        {
+          severity: 'error',
+          message: `Precondition: ${error instanceof Error ? error.message : String(error)}`,
+        },
+      ];
+    }
+
+    const bounded = applyRowBounds(compiled, 0, 0);
+
+    try {
+      await this.readDb.query(bounded.sql, bounded.values, {
+        label: `validate-precondition:${draft.name}`,
+        statementTimeoutMs: 5000,
+      });
+    } catch (error) {
+      return [
+        {
+          severity: 'error',
+          message: `Postgres rejected the precondition: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        },
+      ];
+    }
+
+    return [];
   }
 
   /**
@@ -405,6 +617,18 @@ function collectTemplateNames(text: string): string[] {
   const names: string[] = [];
   for (const match of text.matchAll(
     /\{\{\s*param\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g,
+  )) {
+    if (match[1]) names.push(match[1]);
+  }
+  return names;
+}
+
+const SCOPE_TOKEN_PATTERN = /\{\{\s*scope\s*:\s*[A-Za-z_][A-Za-z0-9_]*\s*\}\}/;
+
+function collectScopeNames(text: string): string[] {
+  const names: string[] = [];
+  for (const match of text.matchAll(
+    /\{\{\s*scope\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g,
   )) {
     if (match[1]) names.push(match[1]);
   }

@@ -11,6 +11,7 @@ import {
   type PlannerFacingFunction,
 } from './function.contract';
 import type { ScopeFilterDefinition } from './sql-template';
+import { DEMO_FUNCTION_NAME } from '../management/demo-function';
 
 interface FunctionRow {
   id: string;
@@ -101,6 +102,20 @@ export class RegistryService {
   }
 
   /** The planner-facing catalogue for one caller. */
+  /**
+   * What the planner is shown.
+   *
+   * The demo function is deliberately dropped once the application has any
+   * other live function. It exists so a fresh install can be tested before
+   * anything is authored — but it lists database tables, which is an answer to
+   * almost any question if nothing better is on offer. Left in the catalogue it
+   * becomes the thing the model reaches for when the real function it needs is
+   * still a draft, and the user gets a confident answer built from table names
+   * instead of "I can't do that yet".
+   *
+   * Keeping it when it is the *only* live function preserves exactly the case
+   * it was added for.
+   */
   async getCatalogueFor(
     applicationId: number,
     role: RoleRecord,
@@ -108,8 +123,15 @@ export class RegistryService {
   ): Promise<PlannerFacingFunction[]> {
     const live = await this.getLiveFunctions(applicationId);
     const allowAll = role.allowedFunctions.includes('*');
+    const supersedeDemo = live.some(
+      (definition) => definition.name !== DEMO_FUNCTION_NAME,
+    );
 
     return live
+      .filter(
+        (definition) =>
+          !supersedeDemo || definition.name !== DEMO_FUNCTION_NAME,
+      )
       .filter(
         (definition) =>
           allowAll || role.allowedFunctions.includes(definition.name),

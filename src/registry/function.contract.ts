@@ -35,20 +35,113 @@ export interface ParamDefinition {
 
 export type ParamSchema = Record<string, ParamDefinition>;
 
+/**
+ * Waiting for a job the host application runs in the background.
+ *
+ * Plenty of useful actions do not finish inside their own request: the host
+ * accepts the work, hands back a job reference, and the real answer appears
+ * somewhere else a few seconds later. Without this the agent can only report
+ * the job reference, which is not what anybody asked for.
+ *
+ * Everything here is declarative and named by the operator. Nothing in the
+ * service knows what a job *is* — only that a field holds a URL, a field holds
+ * a status, and certain values of that status mean stop.
+ */
+export interface HttpPollSpec {
+  /**
+   * Field in the first response holding the URL to poll. It is resolved against
+   * the registered service and rejected if it points anywhere else — the value
+   * arrives in a response body, so it is not trusted to name its own host.
+   */
+  urlFrom?: string;
+  /** Or a path template, when the host returns only an id. Supports {{result:field}}. */
+  path?: string;
+  /** Field holding the job's status. */
+  statusField: string;
+  /** Status values that mean the work finished. */
+  successWhen: string[];
+  /** Status values that mean it failed. Anything else is treated as "still working". */
+  failureWhen?: string[];
+  intervalMs?: number;
+  maxAttempts?: number;
+}
+
+/**
+ * Something an action produced that has to reach the user exactly as it is.
+ *
+ * A URL or a one-time password cannot survive being described — a model asked
+ * to repeat a long signed link will eventually get a character wrong, and a
+ * humanised value is no longer the value. So these bypass the model entirely:
+ * they are appended to the answer verbatim and emitted as their own event.
+ */
+export interface HttpResultSpec {
+  /** Field in the final payload holding a URL to offer the user. */
+  link?: { from: string; label?: string };
+  /**
+   * Fields handed back literally alongside the link — a password, a reference
+   * number. Declared one at a time and off by default, because this is the one
+   * place a stored function decides what leaves the host application.
+   */
+  expose?: Array<{ from: string; label?: string }>;
+}
+
+/**
+ * A read that must return a row before the action runs.
+ *
+ * An HTTP action cannot carry a WHERE clause, so without this the only thing
+ * confining it to the caller's tenant is the host API's own checks — and the
+ * agent would be asserting the tenant rather than proving it. The guard is
+ * compiled by the same template engine as every read function, against the same
+ * declared `scopeFilters`, so an unbindable scope refuses the action exactly as
+ * it refuses a query.
+ */
+export interface HttpPreconditionSpec {
+  /** Parameterized SQL. Must return at least one row for the action to proceed. */
+  sqlTemplate: string;
+  /** What the caller is told when it returns nothing. */
+  denyMessage?: string;
+}
+
 /** A declarative HTTP call back into the host application. */
 export interface HttpRequestSpec {
   /** Name of a service registered for this application. Never a raw host. */
   service: string;
   method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
-  /** Path template; supports {{param:name}}. Values are URL-encoded. */
+  /**
+   * Path template; supports {{param:name}} and {{scope:key}}. Values are
+   * URL-encoded.
+   *
+   * A scope token here must resolve to a concrete value. Exemption means "sees
+   * every value of this key", which is a sensible thing to say about a filter
+   * and a meaningless thing to say about an identifier an action has to act on,
+   * so an exempt role is refused rather than sent an empty segment.
+   */
   path: string;
   headers?: Record<string, string>;
-  /** JSON body template; string leaves support {{param:name}}. */
+  /** JSON body template; string leaves support {{param:name}} and {{scope:key}}. */
   body?: unknown;
   /** Forward the end user's token, when the application supplies one. */
   forwardEndUserToken?: boolean;
   /** Send an Idempotency-Key header derived from the run id. */
   idempotent?: boolean;
+  /** Prove the target is inside the caller's scope before calling out. */
+  precondition?: HttpPreconditionSpec;
+  /** Wait for a background job rather than answering with its reference. */
+  poll?: HttpPollSpec;
+  /** What of the final payload reaches the user, and how. */
+  result?: HttpResultSpec;
+}
+
+/**
+ * A value that must reach the user unaltered: a link to open, or something to
+ * copy. Never enters a model prompt.
+ */
+export interface ResultArtifact {
+  label: string;
+  /** Absolute, and pointing at the service's public base URL when it has one. */
+  url?: string;
+  /** A literal value — a password, a reference. */
+  value?: string;
 }
 
 /**
