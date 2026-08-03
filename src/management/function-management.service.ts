@@ -304,10 +304,19 @@ export class FunctionManagementService {
       }
     }
 
-    if (status === 'approved' && current.validationError) {
-      throw new BadRequestException(
-        `This function does not validate and cannot be approved: ${current.validationError}`,
-      );
+    // Re-run the validator rather than trusting `validation_error`. That column
+    // is a verdict cached at save time, and the rules themselves move: a
+    // function saved under an older build carries that build's opinion forever,
+    // because nothing rewrites the column except another save. Approval would
+    // then be blocked by a verdict no current rule would produce — while the
+    // gate above, which does re-validate, would have let it through.
+    if (status === 'approved') {
+      const validation = await this.validator.validate(toDraft(current));
+      if (!validation.ok) {
+        throw new BadRequestException(
+          `This function does not validate and cannot be approved: ${summarise(validation)}`,
+        );
+      }
     }
 
     // `$4::bigint` is not decoration. Inside a CASE whose other branch is NULL,
