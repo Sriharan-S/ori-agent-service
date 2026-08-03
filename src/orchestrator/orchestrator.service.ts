@@ -58,6 +58,7 @@ export class OrchestratorService {
     conversationId: string | null,
     context: RequestContext,
     emit: AgentEventSink = NOOP_SINK,
+    options: { replaceFromMessageId?: number | null } = {},
   ): Promise<AgentResponse> {
     const startedAt = Date.now();
     const conversationKey = await this.conversations.resolve(
@@ -74,12 +75,44 @@ export class OrchestratorService {
 
     await this.openRun(context, conversationKey, emit !== NOOP_SINK);
 
+    // An edited turn replaces itself and everything after it. This has to
+    // happen before history is read, or the run would answer with the turns it
+    // is meant to be discarding.
+    //
+    // `resolve` returns a *new* conversation when the caller does not own the
+    // one they named, so rewinding is skipped in that case rather than applied
+    // to a fresh conversation where the id means nothing.
+    if (
+      options.replaceFromMessageId != null &&
+      conversationId &&
+      conversationKey === conversationId
+    ) {
+      await this.conversations.supersedeFrom(
+        conversationKey,
+        options.replaceFromMessageId,
+        context,
+      );
+    }
+
     const [pending, history] = await Promise.all([
       this.conversations.getPending(conversationKey),
       this.conversations.getHistory(conversationKey),
     ]);
 
-    await this.conversations.appendTurn(conversationKey, 'user', message);
+    const userMessageId = await this.conversations.appendTurn(
+      conversationKey,
+      'user',
+      message,
+    );
+
+    if (userMessageId !== null) {
+      emit({
+        type: 'turn.recorded',
+        channel: 'user',
+        role: 'user',
+        messageId: userMessageId,
+      });
+    }
 
     const run: AgentRun = { message, conversationKey, context, history };
 
@@ -120,12 +153,24 @@ export class OrchestratorService {
         context.runId,
       );
 
-      await this.conversations.appendTurn(
+      const assistantMessageId = await this.conversations.appendTurn(
         conversationKey,
         'assistant',
         response.message,
         { type: response.type, functionsUsed: response.functionsUsed },
       );
+
+      if (assistantMessageId !== null) {
+        emit({
+          type: 'turn.recorded',
+          channel: 'user',
+          role: 'assistant',
+          messageId: assistantMessageId,
+        });
+      }
+
+      response.userMessageId = userMessageId;
+      response.assistantMessageId = assistantMessageId;
 
       const latencyMs = Date.now() - startedAt;
       await this.closeRun(context, decision.intent, response, latencyMs, null);
@@ -162,6 +207,7 @@ export class OrchestratorService {
           : ORI_STATIC_FALLBACKS.error,
         functionsUsed: [],
         requestId: context.requestId,
+        userMessageId,
       };
 
       await this.closeRun(

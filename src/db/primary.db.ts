@@ -393,7 +393,16 @@ export class PrimaryDb implements OnModuleInit, OnApplicationShutdown {
     ).catch(() => null);
 
     if (recorded === null) return false;
-    if (recorded.length > 0) return true;
+
+    // Bookkeeping exists, so this deployment is on the normal incremental path
+    // and the caller must run whatever is pending. Returning *true* here — as
+    // this did — short-circuited `migrate()` on every existing deployment, so
+    // no migration added after the first install ever ran. It went unnoticed
+    // because every migration until now created a table, and a missing table
+    // fails the check above; the first one to add a *column* silently did
+    // nothing. That is precisely the "quiet way to skip one that adds a column"
+    // the comment above warns about.
+    if (recorded.length > 0) return false;
 
     this.logger.log(
       'Found a complete set of agent tables with no migration history — ' +

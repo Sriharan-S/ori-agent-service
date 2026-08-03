@@ -404,6 +404,38 @@ export function buildMigrations(schema: string): Migration[] {
         CREATE INDEX IF NOT EXISTS agent_audit_fn_idx   ON ${s}.agent_audit_log (function_name, created_at DESC);
       `,
     },
+
+    {
+      // Editing a turn discards the ones after it. They are marked, never
+      // deleted: the agent must not read them again, but an operator looking at
+      // a transcript should still see what was asked and withdrawn — otherwise
+      // the console shows a conversation that never happened. Runs and audit
+      // rows are untouched by this; they remain the record of what actually ran.
+      id: '0007_message_supersede',
+      sql: `
+        ALTER TABLE ${s}.agent_messages
+          ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ;
+
+        -- History reads are always "the live turns of one conversation, in
+        -- order", so the partial index is the whole access pattern.
+        CREATE INDEX IF NOT EXISTS agent_messages_live_idx
+          ON ${s}.agent_messages (conversation_id, created_at)
+          WHERE superseded_at IS NULL;
+      `,
+    },
+
+    {
+      // The URL the agent calls a service on is not always a URL a person can
+      // open: an internal hostname, a container name, a port only reachable
+      // inside the network. When an action hands back a link, the link has to
+      // work in a browser — so a service may declare a second, public base URL
+      // that outbound links are rebuilt against. Null means they are the same.
+      id: '0008_service_public_url',
+      sql: `
+        ALTER TABLE ${s}.agent_services
+          ADD COLUMN IF NOT EXISTS public_base_url TEXT;
+      `,
+    },
   ];
 }
 

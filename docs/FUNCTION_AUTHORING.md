@@ -190,6 +190,131 @@ logic in one place, and produces a clean two-step audit trail: *looked up X* →
 `service` must be registered for the application. An action cannot name a host —
 see [SECURITY.md](./SECURITY.md#http-actions).
 
+### 6a. Acting on the caller's own record
+
+Not every action has an id to be handed. "Generate *my* report" has no lookup
+step — the identity is the caller's, and demanding it as a parameter would mean
+accepting a user id the agent would have to trust.
+
+For that, a path or body may use `{{scope:key}}`:
+
+```json
+{
+  "service": "reports",
+  "method": "GET",
+  "path": "/report/generate/student/{{scope:user_id}}"
+}
+```
+
+The value comes from the caller's proven scope, never from the model. Two rules
+follow from that, and both fail closed:
+
+- **No value, no call.** A caller whose role is not exempt and who supplied no
+  value for the key is refused before anything leaves the process.
+- **An exempt role is refused too.** Exemption means "sees every value of this
+  key". That is a coherent thing to say about a filter and a meaningless one
+  about an identifier an action must act *on* — there is no "every user" to put
+  in a URL. Compiling it away would send an empty path segment and quietly
+  address the wrong resource, so it is a refusal instead.
+
+An action satisfies the "never act on a name" rule with either a
+`resolvedIdentifier` parameter or a scope binding. It needs one of the two.
+
+### 6b. Proving the target is in scope
+
+A read function carries its tenant filter in its own `WHERE` clause. An action
+cannot: it is an HTTP call, and the filtering happens on the other side. Left
+there, the agent is *asserting* the tenant and trusting the target API to check
+it.
+
+A `precondition` closes that. It is a read that must return a row before the
+call goes out:
+
+```json
+{
+  "service": "reports",
+  "method": "GET",
+  "path": "/report/generate/student/{{param:user_id}}",
+  "precondition": {
+    "sqlTemplate": "SELECT 1 FROM registrations r WHERE r.user_id = {{param:user_id}} AND {{scope:corporate_account_id}}",
+    "denyMessage": "That candidate is not in your account."
+  }
+}
+```
+
+It is compiled by the same template engine as every read function, against the
+same declared `scopeFilters`, and runs on the same read-only connection. So a
+scope that cannot be bound refuses the action exactly as it refuses a query, and
+an exempt role compiles the filter to `TRUE` and passes.
+
+Three ways it stops: the scope will not bind, the query returns no row, or the
+query fails to run. All three refuse. A guard that could not run has not passed.
+
+### 6c. Waiting for a background job
+
+Some APIs accept work and finish it later, handing back a job reference. Without
+help, the agent can only report that reference — which is not what anyone asked
+for.
+
+A `poll` block makes the agent follow the job:
+
+```json
+{
+  "poll": {
+    "urlFrom": "statusUrl",
+    "statusField": "status",
+    "successWhen": ["COMPLETED"],
+    "failureWhen": ["ERROR"],
+    "intervalMs": 2000,
+    "maxAttempts": 30
+  }
+}
+```
+
+`urlFrom` names the field in the first response holding the follow-up URL. Use
+`path` instead when the host returns only an id — it templates with
+`{{result:field}}`.
+
+**The follow-up URL is re-pinned to the registered service.** It arrives in a
+response body, which makes it attacker-adjacent input: a host that can be made
+to echo a URL would otherwise become a request-forgery primitive. A follow-up
+that resolves anywhere but the registered origin is refused, not followed.
+
+Two bounds apply on top of the function's own: `OUTBOUND_POLL_MIN_INTERVAL_MS`
+floors the interval, and `OUTBOUND_POLL_MAX_MS` caps the total wait. A job that
+outlives the cap is reported as still being prepared — which is true, and more
+useful than an error the host never gave.
+
+### 6d. Handing back a link
+
+A URL cannot survive being described. A model asked to repeat a long signed link
+will eventually get a character wrong, and a humanised value is no longer the
+value.
+
+So declared results bypass the model entirely:
+
+```json
+{
+  "result": {
+    "link": { "from": "downloadUrl", "label": "Download report" },
+    "expose": [{ "from": "password", "label": "Password" }]
+  }
+}
+```
+
+The model is told an artifact is coming — so the sentence it writes makes room
+for it — and is never shown the value. The link is appended to the answer
+verbatim and emitted as its own `artifact` event, so a client can render a
+button instead of parsing prose.
+
+Links are rebuilt against the service's **public base URL**, set on the
+Applications page. The address the agent calls is often not one a browser can
+open; without this, an action would hand out a link to an internal host.
+
+`expose` hands a value over literally. It never reaches a prompt, but everyone
+who can call the function will see it — declare one field at a time, and only
+what the answer genuinely needs.
+
 ### 7. Validate, approve, go live
 
 **Validate** compiles your template and asks Postgres. You get back:

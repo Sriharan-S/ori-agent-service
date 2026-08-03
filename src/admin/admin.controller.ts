@@ -232,11 +232,27 @@ export class AdminController {
   async upsertService(
     @Param('id', ParseIntPipe) id: number,
     @Param('name') name: string,
-    @Body() body: { baseUrl: string },
+    @Body() body: { baseUrl: string; publicBaseUrl?: string | null },
   ) {
     return {
-      service: await this.applications.upsertService(id, name, body.baseUrl),
+      service: await this.applications.upsertService(
+        id,
+        name,
+        body.baseUrl,
+        body.publicBaseUrl ?? null,
+      ),
     };
+  }
+
+  @Delete('applications/:id/services/:name')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async deleteService(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('name') name: string,
+  ) {
+    await this.applications.removeService(id, name);
+    return { deleted: true };
   }
 
   // ── API keys ───────────────────────────────────────────────────────────────

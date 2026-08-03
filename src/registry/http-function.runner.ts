@@ -1,19 +1,39 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { CONFIG, type AppConfig } from '../config/configuration';
 import { PrimaryDb, quoteIdent } from '../db/primary.db';
+import { ReadDb } from '../db/read.db';
 import type { RequestContext } from '../auth/identity';
 import type {
   FunctionDefinition,
   FunctionResult,
   HttpRequestSpec,
+  ResultArtifact,
 } from './function.contract';
+import {
+  applyRowBounds,
+  compileSqlTemplate,
+  SqlTemplateError,
+} from './sql-template';
 
 interface ServiceRow {
   name: string;
   base_url: string;
+  public_base_url: string | null;
 }
 
+interface ResolvedService {
+  baseUrl: string;
+  /** Where a link handed to a person should point. Falls back to `baseUrl`. */
+  publicBaseUrl: string;
+}
+
+/** Raised when a value a token needs is absent. Always a refusal, never a 500. */
+class ActionRefused extends Error {}
+
 const PARAM_TOKEN = /\{\{\s*param\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
+const SCOPE_TOKEN = /\{\{\s*scope\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
+/** Only valid in a poll path, where the first response's fields are in hand. */
+const RESULT_TOKEN = /\{\{\s*result\s*:\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}/g;
 
 /**
  * Executes a write function as an HTTP call back into the host application.
@@ -33,19 +53,25 @@ export class HttpFunctionRunner {
   private readonly logger = new Logger(HttpFunctionRunner.name);
   private readonly services = new Map<
     number,
-    { entries: Map<string, string>; expiresAt: number }
+    { entries: Map<string, ResolvedService>; expiresAt: number }
   >();
 
   constructor(
     @Inject(CONFIG) private readonly config: AppConfig,
     private readonly db: PrimaryDb,
+    private readonly readDb: ReadDb,
   ) {}
 
   async run(
     definition: FunctionDefinition,
     params: Record<string, unknown>,
     context: RequestContext,
-  ): Promise<{ result: FunctionResult; afterState?: Record<string, unknown> }> {
+  ): Promise<{
+    result: FunctionResult;
+    afterState?: Record<string, unknown>;
+    artifacts?: ResultArtifact[];
+    scopesApplied?: Record<string, string | number>;
+  }> {
     const spec = definition.httpRequest;
     if (!spec) {
       return {
@@ -57,10 +83,28 @@ export class HttpFunctionRunner {
       };
     }
 
+    // Prove the target is inside the caller's scope before anything leaves this
+    // process. An action that has already run cannot be un-run by a later check.
+    let scopesApplied: Record<string, string | number> = {};
+    if (spec.precondition) {
+      const guard = await this.checkPrecondition(definition, params, context);
+      if (guard.result) return { result: guard.result, scopesApplied: guard.scopesApplied };
+      scopesApplied = guard.scopesApplied;
+    }
+
+    let service: ResolvedService;
     let url: URL;
     try {
-      url = await this.resolveUrl(context.application.id, spec, params);
+      service = await this.resolveService(context.application.id, spec.service);
+      url = this.buildUrl(service.baseUrl, spec.path, params, context);
     } catch (error) {
+      if (error instanceof ActionRefused) {
+        this.logger.warn(`${definition.name} refused: ${error.message}`);
+        return {
+          result: { status: 'denied', reason: error.message },
+          scopesApplied,
+        };
+      }
       this.logger.error(
         `${definition.name}: ${error instanceof Error ? error.message : String(error)}`,
       );
@@ -70,6 +114,7 @@ export class HttpFunctionRunner {
           message: 'That action is not configured correctly.',
           retryable: false,
         },
+        scopesApplied,
       };
     }
 
@@ -91,63 +136,45 @@ export class HttpFunctionRunner {
       headers['idempotency-key'] = context.runId;
     }
 
-    const body =
-      spec.method === 'GET' || spec.body === undefined || spec.body === null
-        ? undefined
-        : JSON.stringify(substituteDeep(spec.body, params));
+    let body: string | undefined;
+    try {
+      body =
+        spec.method === 'GET' || spec.body === undefined || spec.body === null
+          ? undefined
+          : JSON.stringify(substituteDeep(spec.body, params, context));
+    } catch (error) {
+      if (error instanceof ActionRefused) {
+        return { result: { status: 'denied', reason: error.message }, scopesApplied };
+      }
+      throw error;
+    }
 
     if (body !== undefined) headers['content-type'] = 'application/json';
 
-    const controller = new AbortController();
-    const timer = setTimeout(
-      () => controller.abort(),
-      this.config.outbound.timeoutMs,
-    );
-
+    let parsed: unknown;
     try {
-      const response = await fetch(url, {
+      const first = await this.send(url, {
         method: spec.method,
         headers,
         ...(body !== undefined ? { body } : {}),
-        signal: controller.signal,
-        redirect: 'error',
       });
 
-      const text = await response.text();
-      const parsed = safeJson(text);
-
-      if (!response.ok) {
+      if (first.failure) {
         this.logger.warn(
-          `${definition.name} → ${spec.method} ${url.pathname} returned ${response.status}`,
+          `${definition.name} → ${spec.method} ${url.pathname} returned ${first.status}`,
         );
-
-        if (response.status === 401 || response.status === 403) {
-          return {
-            result: {
-              status: 'denied',
-              reason: "You don't have permission to make that change.",
-            },
-          };
-        }
-
-        return {
-          result: {
-            status: 'error',
-            message: extractMessage(parsed, response.status),
-            // Writes are never retried automatically. Without an idempotency
-            // guarantee from the target, a retry after a timeout can duplicate
-            // the change.
-            retryable: false,
-          },
-        };
+        return { result: first.failure, scopesApplied };
       }
 
-      const after = isRecord(parsed) ? parsed : { response: parsed };
+      parsed = first.payload;
 
-      return {
-        result: { status: 'single', data: after, confidence: 1 },
-        afterState: after,
-      };
+      // The host accepted the work but has not done it yet. Follow the job it
+      // named until it settles, and answer with the finished thing.
+      if (spec.poll) {
+        const settled = await this.awaitJob(definition, spec, service, parsed);
+        if (settled.result) return { result: settled.result, scopesApplied };
+        parsed = settled.payload;
+      }
     } catch (error) {
       const aborted = error instanceof Error && error.name === 'AbortError';
       this.logger.error(
@@ -164,65 +191,388 @@ export class HttpFunctionRunner {
             : 'That action could not be completed.',
           retryable: false,
         },
+        scopesApplied,
+      };
+    }
+
+    const after = isRecord(parsed) ? parsed : { response: parsed };
+    const artifacts = this.collectArtifacts(definition, spec, service, after);
+
+    return {
+      result: { status: 'single', data: after, confidence: 1 },
+      afterState: after,
+      ...(artifacts.length > 0 ? { artifacts } : {}),
+      scopesApplied,
+    };
+  }
+
+  /**
+   * One outbound request, with the service-wide timeout applied.
+   *
+   * `redirect: 'error'` rather than following: a redirect is a host telling us
+   * to go somewhere the origin check never saw.
+   */
+  private async send(
+    url: URL,
+    init: { method: string; headers: Record<string, string>; body?: string },
+  ): Promise<{ payload: unknown; status: number; failure?: FunctionResult }> {
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      this.config.outbound.timeoutMs,
+    );
+
+    try {
+      const response = await fetch(url, {
+        ...init,
+        signal: controller.signal,
+        redirect: 'error',
+      });
+
+      const payload = safeJson(await response.text());
+      if (response.ok) return { payload, status: response.status };
+
+      if (response.status === 401 || response.status === 403) {
+        return {
+          payload,
+          status: response.status,
+          failure: {
+            status: 'denied',
+            reason: "You don't have permission to make that change.",
+          },
+        };
+      }
+
+      return {
+        payload,
+        status: response.status,
+        failure: {
+          status: 'error',
+          message: extractMessage(payload, response.status),
+          // Writes are never retried automatically. Without an idempotency
+          // guarantee from the target, a retry after a timeout can duplicate
+          // the change.
+          retryable: false,
+        },
       };
     } finally {
       clearTimeout(timer);
     }
   }
 
-  /** Resolves the service name to a registered base URL and applies the path. */
-  private async resolveUrl(
-    applicationId: number,
+  /**
+   * Follow a background job to its conclusion.
+   *
+   * Two bounds, both of which must hold: the function's own attempt count, and
+   * the service-wide ceiling on how long any caller is made to wait. Neither is
+   * the author's to exceed.
+   */
+  private async awaitJob(
+    definition: FunctionDefinition,
     spec: HttpRequestSpec,
+    service: ResolvedService,
+    accepted: unknown,
+  ): Promise<{ payload?: unknown; result?: FunctionResult }> {
+    const poll = spec.poll!;
+    const interval = Math.max(
+      poll.intervalMs ?? 2000,
+      this.config.outbound.pollMinIntervalMs,
+    );
+    const maxAttempts = Math.max(1, poll.maxAttempts ?? 20);
+    const deadline = Date.now() + this.config.outbound.pollMaxMs;
+
+    let url: URL;
+    try {
+      url = this.pollUrl(service, poll, accepted);
+    } catch (error) {
+      this.logger.error(
+        `${definition.name}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return {
+        result: {
+          status: 'error',
+          message:
+            'That action was started but the service did not say where to follow it up.',
+          retryable: false,
+        },
+      };
+    }
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (Date.now() >= deadline) break;
+
+      const polled = await this.send(url, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+      });
+
+      if (polled.failure) {
+        this.logger.warn(
+          `${definition.name} poll ${attempt}/${maxAttempts} → ${polled.status}`,
+        );
+        return { result: polled.failure };
+      }
+
+      // `scalar` rather than String(): a host that answers with an object here
+      // would otherwise compare as "[object Object]" and never match anything,
+      // turning a misconfiguration into a silent timeout.
+      const status = scalar(
+        isRecord(polled.payload) ? polled.payload[poll.statusField] : null,
+      );
+
+      if (poll.successWhen.includes(status)) {
+        this.logger.log(
+          `${definition.name} job finished after ${attempt} poll(s)`,
+        );
+        return { payload: polled.payload };
+      }
+
+      if ((poll.failureWhen ?? []).includes(status)) {
+        return {
+          result: {
+            status: 'error',
+            message: extractMessage(polled.payload, 500),
+            retryable: true,
+          },
+        };
+      }
+
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await sleep(Math.min(interval, remaining));
+    }
+
+    // Not a failure: the work is very likely still running. Saying so is more
+    // useful, and more honest, than reporting an error the host never gave.
+    this.logger.warn(`${definition.name} job did not finish within the wait`);
+    return {
+      result: {
+        status: 'error',
+        message:
+          'That is still being prepared — it is taking longer than usual. Ask me again shortly.',
+        retryable: true,
+      },
+    };
+  }
+
+  /** Where to follow the job up, checked against the service's own origin. */
+  private pollUrl(
+    service: ResolvedService,
+    poll: NonNullable<HttpRequestSpec['poll']>,
+    accepted: unknown,
+  ): URL {
+    const record = isRecord(accepted) ? accepted : {};
+
+    if (poll.urlFrom) {
+      const raw = record[poll.urlFrom];
+      if (typeof raw !== 'string' || raw.trim() === '') {
+        throw new Error(
+          `Response holds no usable "${poll.urlFrom}" to poll (got ${JSON.stringify(raw)}).`,
+        );
+      }
+      // The value came out of a response body, so it is not trusted to name its
+      // own host: it is resolved against the registered base and rejected if it
+      // lands anywhere else.
+      return pinToOrigin(service.baseUrl, raw);
+    }
+
+    if (poll.path) {
+      const path = poll.path.replace(RESULT_TOKEN, (_match, field: string) =>
+        encodeURIComponent(scalar(readPath(record, field))),
+      );
+      return pinToOrigin(service.baseUrl, path);
+    }
+
+    throw new Error('Poll configuration names neither urlFrom nor path.');
+  }
+
+  /**
+   * The values that must reach the user unaltered.
+   *
+   * Deliberately not merged into the data the model sees: a link goes out
+   * verbatim or not at all.
+   */
+  private collectArtifacts(
+    definition: FunctionDefinition,
+    spec: HttpRequestSpec,
+    service: ResolvedService,
+    payload: Record<string, unknown>,
+  ): ResultArtifact[] {
+    const artifacts: ResultArtifact[] = [];
+    const result = spec.result;
+    if (!result) return artifacts;
+
+    if (result.link) {
+      const raw = readPath(payload, result.link.from);
+      if (typeof raw === 'string' && raw.trim() !== '') {
+        try {
+          artifacts.push({
+            label: result.link.label ?? 'Open',
+            // Rebuilt against the public base URL: the host may have answered
+            // with a path, or with an address only reachable from inside.
+            url: pinToOrigin(service.publicBaseUrl, raw).toString(),
+          });
+        } catch (error) {
+          this.logger.warn(
+            `${definition.name}: discarding link "${raw}" — ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
+    }
+
+    for (const field of result.expose ?? []) {
+      const raw = readPath(payload, field.from);
+      if (raw === null || raw === undefined || raw === '') continue;
+      artifacts.push({ label: field.label ?? field.from, value: scalar(raw) });
+    }
+
+    return artifacts;
+  }
+
+  /**
+   * Run the scope guard.
+   *
+   * Compiled by the same engine as every read function and against the same
+   * declared `scopeFilters`, so "refusing to run unscoped" means here exactly
+   * what it means there.
+   */
+  private async checkPrecondition(
+    definition: FunctionDefinition,
     params: Record<string, unknown>,
-  ): Promise<URL> {
+    context: RequestContext,
+  ): Promise<{
+    result?: FunctionResult;
+    scopesApplied: Record<string, string | number>;
+  }> {
+    const precondition = definition.httpRequest!.precondition!;
+
+    let compiled;
+    try {
+      compiled = compileSqlTemplate({
+        template: precondition.sqlTemplate,
+        params,
+        scopeFilters: definition.scopeFilters,
+        scopeValues: context.endUser.scopes,
+        unscopedKeys: context.role.unscopedKeys,
+      });
+    } catch (error) {
+      if (error instanceof SqlTemplateError) {
+        this.logger.warn(
+          `${definition.name} refused for role ${context.role.name}: ${error.message}`,
+        );
+        return {
+          result: {
+            status: 'denied',
+            reason: precondition.denyMessage ?? 'You do not have access to that.',
+          },
+          scopesApplied: {},
+        };
+      }
+      throw error;
+    }
+
+    const bounded = applyRowBounds(compiled, 1, 0);
+
+    try {
+      const probe = await this.readDb.query<Record<string, unknown>>(
+        bounded.sql,
+        bounded.values,
+        { label: `precondition:${definition.name}` },
+      );
+
+      if (probe.rows.length === 0) {
+        this.logger.warn(
+          `${definition.name} refused: precondition matched no row for ${context.endUser.id}`,
+        );
+        return {
+          result: {
+            status: 'denied',
+            reason: precondition.denyMessage ?? 'You do not have access to that.',
+          },
+          scopesApplied: compiled.scopesApplied,
+        };
+      }
+    } catch (error) {
+      this.logger.error(
+        `${definition.name} precondition failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      // A guard that could not run has not passed.
+      return {
+        result: {
+          status: 'error',
+          message: 'That action could not be checked, so it was not attempted.',
+          retryable: true,
+        },
+        scopesApplied: {},
+      };
+    }
+
+    return { scopesApplied: compiled.scopesApplied };
+  }
+
+  /** Applies the path template to the registered base URL. */
+  private buildUrl(
+    baseUrl: string,
+    template: string,
+    params: Record<string, unknown>,
+    context: RequestContext,
+  ): URL {
+    // Values are URL-encoded, so one cannot introduce a new path segment or a
+    // query string.
+    const path = template
+      .replace(PARAM_TOKEN, (_match, name: string) =>
+        encodeURIComponent(scalar(params[name])),
+      )
+      .replace(SCOPE_TOKEN, (_match, key: string) =>
+        encodeURIComponent(scalar(readScope(key, context))),
+      );
+
+    return pinToOrigin(baseUrl, path);
+  }
+
+  private async resolveService(
+    applicationId: number,
+    name: string,
+  ): Promise<ResolvedService> {
     const services = await this.getServices(applicationId);
-    const baseUrl = services.get(spec.service);
+    const service = services.get(name);
 
-    if (!baseUrl) {
+    if (!service) {
       throw new Error(
-        `Action names service "${spec.service}", which is not registered for this application.`,
+        `Action names service "${name}", which is not registered for this application.`,
       );
     }
 
-    // Path parameters are URL-encoded, so a value cannot introduce a new path
-    // segment or a query string.
-    const path = spec.path.replace(PARAM_TOKEN, (_match, name: string) =>
-      encodeURIComponent(scalar(params[name])),
-    );
-
-    const url = new URL(
-      path.startsWith('/') ? path.slice(1) : path,
-      baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`,
-    );
-
-    const base = new URL(baseUrl);
-    if (url.origin !== base.origin) {
-      throw new Error(
-        `Resolved URL ${url.origin} escapes the registered service origin ${base.origin}.`,
-      );
-    }
-
-    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-      throw new Error(`Refusing protocol ${url.protocol}.`);
-    }
-
-    return url;
+    return service;
   }
 
   private async getServices(
     applicationId: number,
-  ): Promise<Map<string, string>> {
+  ): Promise<Map<string, ResolvedService>> {
     const cached = this.services.get(applicationId);
     if (cached && cached.expiresAt > Date.now()) return cached.entries;
 
     const rows = await this.db.query<ServiceRow>(
-      `SELECT name, base_url FROM ${quoteIdent(this.db.schema)}.agent_services
+      `SELECT name, base_url, public_base_url
+         FROM ${quoteIdent(this.db.schema)}.agent_services
         WHERE application_id = $1`,
       [applicationId],
     );
 
-    const entries = new Map(rows.map((row) => [row.name, row.base_url]));
+    const entries = new Map(
+      rows.map((row): [string, ResolvedService] => [
+        row.name,
+        {
+          baseUrl: row.base_url,
+          publicBaseUrl: row.public_base_url || row.base_url,
+        },
+      ]),
+    );
+
     this.services.set(applicationId, {
       entries,
       expiresAt: Date.now() + 30_000,
@@ -236,28 +586,113 @@ export class HttpFunctionRunner {
   }
 }
 
-function substituteDeep(value: unknown, params: Record<string, unknown>): unknown {
-  if (typeof value === 'string') {
-    // A leaf that is exactly one token keeps the parameter's own type, so a
-    // number stays a number rather than becoming "42".
-    const exact = value.match(
-      /^\{\{\s*param\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$/,
-    );
-    if (exact?.[1]) return params[exact[1]] ?? null;
+/**
+ * Resolve a path or URL against a base, and refuse anything that leaves it.
+ *
+ * Used for the outbound path, for the follow-up URL a host names in its own
+ * response, and for the link handed back to the user. The second of those is
+ * why this exists as a shared function rather than a check done once: a URL out
+ * of a response body is attacker-adjacent input, and resolving it without
+ * re-pinning would turn any host that can be made to echo a URL into a request
+ * forgery primitive.
+ */
+function pinToOrigin(baseUrl: string, candidate: string): URL {
+  const base = new URL(baseUrl);
+  const url = new URL(
+    candidate.startsWith('/') ? candidate.slice(1) : candidate,
+    baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`,
+  );
 
-    return value.replace(PARAM_TOKEN, (_match, name: string) =>
-      scalar(params[name]),
+  if (url.origin !== base.origin) {
+    throw new Error(
+      `Resolved URL ${url.origin} escapes the registered service origin ${base.origin}.`,
     );
   }
 
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    throw new Error(`Refusing protocol ${url.protocol}.`);
+  }
+
+  return url;
+}
+
+/**
+ * A scope value for a token in a path or body.
+ *
+ * Exemption is not an answer here. A role exempt from `user_id` sees every
+ * user's rows, which is a coherent thing to say about a filter and an incoherent
+ * one about an identifier an action must act *on* — there is no "every user" to
+ * put in a URL. So an exempt role is refused rather than sent an empty segment,
+ * which would otherwise silently address the wrong resource.
+ */
+function readScope(key: string, context: RequestContext): string | number {
+  if (context.role.unscopedKeys.includes(key)) {
+    throw new ActionRefused(
+      `This action acts on a specific ${key.replace(/_/g, ' ')}, and the ${context.role.name} ` +
+        'role supplies none. Look the record up first and use the action that takes its id.',
+    );
+  }
+
+  const value = context.endUser.scopes[key];
+  if (value === undefined || value === null || value === '') {
+    throw new ActionRefused(
+      `This action needs a ${key.replace(/_/g, ' ')} and none was supplied.`,
+    );
+  }
+
+  return value;
+}
+
+/** `a.b.c` against a parsed payload. Absent at any step yields undefined. */
+function readPath(payload: unknown, path: string): unknown {
+  let cursor: unknown = payload;
+  for (const segment of path.split('.')) {
+    if (!isRecord(cursor)) return undefined;
+    cursor = cursor[segment];
+  }
+  return cursor;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
+function substituteDeep(
+  value: unknown,
+  params: Record<string, unknown>,
+  context: RequestContext,
+): unknown {
+  if (typeof value === 'string') {
+    // A leaf that is exactly one token keeps the value's own type, so a number
+    // stays a number rather than becoming "42".
+    const exactParam = value.match(
+      /^\{\{\s*param\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$/,
+    );
+    if (exactParam?.[1]) return params[exactParam[1]] ?? null;
+
+    const exactScope = value.match(
+      /^\{\{\s*scope\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$/,
+    );
+    if (exactScope?.[1]) return readScope(exactScope[1], context);
+
+    return value
+      .replace(PARAM_TOKEN, (_match, name: string) => scalar(params[name]))
+      .replace(SCOPE_TOKEN, (_match, key: string) =>
+        scalar(readScope(key, context)),
+      );
+  }
+
   if (Array.isArray(value)) {
-    return value.map((entry) => substituteDeep(entry, params));
+    return value.map((entry) => substituteDeep(entry, params, context));
   }
 
   if (isRecord(value)) {
     const output: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(value)) {
-      output[key] = substituteDeep(entry, params);
+      output[key] = substituteDeep(entry, params, context);
     }
     return output;
   }

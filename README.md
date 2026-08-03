@@ -286,7 +286,7 @@ docs/             SECURITY, FUNCTION_AUTHORING, PORT_AUDIT
 
 ```bash
 npm run start:dev    # watch mode
-npm test             # 231 tests, no network, no database
+npm test             # 470 tests, no network, no database
 npm run typecheck
 npm run lint
 npm run build

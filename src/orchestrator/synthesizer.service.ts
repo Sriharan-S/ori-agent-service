@@ -88,7 +88,7 @@ ${buildEvidence(outcomes)}`,
         emit({ type: 'message.delta', channel: 'user', text: next.value });
       }
 
-      return text.trim();
+      return this.appendArtifacts(text.trim(), outcomes, emit);
     } catch (error) {
       this.logger.error(
         `Synthesis failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -96,8 +96,36 @@ ${buildEvidence(outcomes)}`,
       // A deterministic rendering beats an error when the data is already here.
       const fallback = renderWithoutLlm(outcomes);
       emit({ type: 'message.delta', channel: 'user', text: fallback });
-      return fallback;
+      return this.appendArtifacts(fallback, outcomes, emit);
     }
+  }
+
+  /**
+   * Put links and one-time values into the answer without the model's help.
+   *
+   * The model is told an artifact exists but never shown it — see
+   * `buildEvidence`. Appending here is what makes that safe: the URL in the
+   * answer is the URL the host returned, not a reconstruction of it, and a
+   * password is quoted rather than paraphrased. Both are also emitted as their
+   * own events, so a richer client can render a button and ignore this text.
+   */
+  private appendArtifacts(
+    answer: string,
+    outcomes: CallOutcome[],
+    emit: AgentEventSink,
+  ): string {
+    const artifacts = outcomes.flatMap((outcome) => outcome.artifacts ?? []);
+    if (artifacts.length === 0) return answer;
+
+    const lines = artifacts.map((artifact) =>
+      artifact.url
+        ? `- [${artifact.label}](${artifact.url})`
+        : `- ${artifact.label}: \`${artifact.value ?? ''}\``,
+    );
+
+    const appended = `\n\n${lines.join('\n')}`;
+    emit({ type: 'message.delta', channel: 'user', text: appended });
+    return `${answer}${appended}`;
   }
 
   /** The clarifying question. Built without the model, deliberately. */
@@ -193,12 +221,23 @@ function buildEvidence(outcomes: CallOutcome[]): string {
     .map((outcome) => {
       const { result } = outcome;
 
+      // An artifact is named but never shown. The model needs to know one is
+      // coming so the sentence it writes makes room for it ("here is your
+      // report"), and must not see the value, because a model that has seen a
+      // URL will eventually write a subtly different one.
+      const artifactNote =
+        outcome.artifacts && outcome.artifacts.length > 0
+          ? `\nThe following will be shown to the user directly, immediately after your answer: ${outcome.artifacts
+              .map((artifact) => artifact.label.toLowerCase())
+              .join(', ')}. Refer to it as ready. Do not invent a link or a code.`
+          : '';
+
       switch (result.status) {
         case 'single': {
           const described = presentRecord(result.data);
           return described === null
-            ? 'A record was found but it held nothing worth reporting.'
-            : `One record was found:\n${described}`;
+            ? `The action completed.${artifactNote}`
+            : `One record was found:\n${described}${artifactNote}`;
         }
         case 'list': {
           if (result.data.length === 0) return 'Nothing was found.';

@@ -977,6 +977,23 @@ pre.code.tall { max-height: 340px; overflow-y: auto; }
 .pg__bubble--user .pg__who { flex-direction: row-reverse; }
 .pg__who .avatar { width: 22px; height: 22px; font-size: 10px; }
 
+/* Turn actions sit in the byline rather than over the message, so they never
+   cover text. Revealed on hover on a pointer device; always visible without
+   one, because there is no hover to reveal them with. */
+.pg__actions { display: flex; gap: 4px; margin-inline-start: auto; }
+.pg__bubble--user .pg__actions { margin-inline: 0 auto; }
+.pg__actions .btn { padding: 2px 7px; font-size: 11px; min-height: 0; }
+
+@media (hover: hover) {
+  .pg__actions { opacity: 0; transition: opacity 120ms ease; }
+  .pg__bubble:hover .pg__actions,
+  .pg__actions:focus-within { opacity: 1; }
+}
+
+.pg__edit { display: grid; gap: 6px; margin-top: 4px; }
+.pg__edit-input { width: 100%; min-height: 64px; font-size: 13.5px; }
+.pg__edit-actions { display: flex; gap: 6px; justify-content: flex-end; }
+
 .pg__text {
   padding: 10px 13px;
   border-radius: var(--radius-lg);
@@ -1040,6 +1057,79 @@ pre.code.tall { max-height: 340px; overflow-y: auto; }
 .pg__call { padding-left: 2px; }
 
 /* The phase currently running, replaced by the answer when it starts. */
+/* The phase track. Every stage is listed from the start, so a fast run leaves
+   a record and a slow one shows which phase it is sitting in. */
+.pg__stages {
+  display: grid;
+  gap: 3px;
+  margin-bottom: 8px;
+  padding: 8px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+  font-size: 12px;
+}
+.pg__stage-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-muted);
+}
+.pg__stage-mark {
+  width: 11px;
+  height: 11px;
+  flex: none;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-strong);
+}
+.pg__stage-row.is-pending { opacity: .5; }
+.pg__stage-row.is-active { color: var(--text); font-weight: 600; }
+.pg__stage-row.is-active .pg__stage-mark {
+  border-color: var(--accent);
+  border-top-color: transparent;
+  animation: pg-spin .7s linear infinite;
+}
+.pg__stage-row.is-done .pg__stage-mark {
+  border-color: var(--ok);
+  background: var(--ok);
+}
+.pg__stage-row.is-failed .pg__stage-mark {
+  border-color: var(--bad);
+  background: var(--bad);
+}
+.pg__stage-ms {
+  margin-inline-start: auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  opacity: .75;
+}
+.pg__stage-total {
+  margin-top: 4px;
+  padding-top: 5px;
+  border-top: 1px dashed var(--border);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* The agent's own account of what it is doing, as it arrives. */
+.pg__thinking {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 8px;
+  padding: 8px 11px;
+  border-inline-start: 2px solid var(--accent);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  background: var(--bg-subtle);
+}
+.pg__thought {
+  font-size: 12.5px;
+  font-style: italic;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
 .pg__stage {
   display: flex;
   align-items: center;
@@ -1092,6 +1182,21 @@ pre.code.tall { max-height: 340px; overflow-y: auto; }
   font-size: 12px;
 }
 .pg__tag { margin-top: 8px; }
+
+/* An action's output, rendered as a control rather than left as a URL in prose. */
+.pg__artifact {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+  font-size: 12.5px;
+}
+.pg__artifact a { font-weight: 600; }
+.pg__artifact code { font-size: 12px; }
 
 .pg__composer {
   flex: 0 0 auto;

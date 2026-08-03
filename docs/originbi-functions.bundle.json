@@ -1,7 +1,7 @@
 {
   "bundle": "ori.function-bundle",
   "version": 1,
-  "exportedAt": "2026-07-30T00:00:00.000Z",
+  "exportedAt": "2026-07-31T07:58:43.263Z",
   "application": {
     "slug": "originbi",
     "name": "OriginBI"
@@ -9,8 +9,13 @@
   "_notes": [
     "Read functions for the OriginBI assessment platform.",
     "Scope keys: corporate_account_id (B2B tenant), user_id (a student's own rows). ADMIN is exempt from both.",
-    "Every query is dedup-safe: the dev database is double-seeded (sessions, attempts, reports, corporate_accounts and groups all have exactly two physical rows per id, with no primary key). DISTINCT ON (id) and COUNT(DISTINCT id) make each function correct whether or not that is fixed.",
-    "Roles expected in the application: STUDENT, CORPORATE, ADMIN. Import this, create those roles, then take the functions live."
+    "Every query is dedup-safe: the dev database is double-seeded (sessions, attempts, reports, corporate_accounts, aci_score_bands and groups all have exactly two physical rows per id, with no primary key). DISTINCT ON (id) and COUNT(DISTINCT id) make each function correct whether or not that is fixed.",
+    "An assessment level's id is NOT its level number: level 3 (IAT) is id 5 and level 4 (Metaphor) is id 3. Every level function joins assessment_levels and orders by sort_order rather than assuming.",
+    "Levels 1 (DISC) and 2 (ACI) carry a numeric score. Levels 3 (IAT) and 4 (Metaphor) do not — they are pattern-based, so their functions report completion and pattern detail, never a mark.",
+    "A candidate may retake a level. The per-level functions return the most recent attempt for each level, not every attempt.",
+    "Roles expected in the application: STUDENT, CORPORATE, ADMIN. Import this, create those roles, then take the functions live.",
+    "The two report actions are HTTP calls into student-service, not database writes. They need a service named \"reports\" registered on the Applications page, and the role must hold the \"reports.generate\" write scope. See docs/ORIGINBI_REPORT_SETUP.md.",
+    "The report endpoint is keyed on users.id, NOT registrations.id — find_candidate returns both, and generate_candidate_report takes the user id. Passing a registration id there would generate a different person's report."
   ],
   "functions": [
     {
@@ -59,7 +64,7 @@
           "column": "r.corporate_account_id"
         }
       ],
-      "sqlTemplate": "SELECT DISTINCT ON (r.id)\n       r.id AS id,\n       r.full_name AS label,\n       coalesce(p.name, 'no program') || ' · ' || coalesce(s.status, 'no session yet') AS detail,\n       CASE\n         WHEN r.id = {{param:registration_id}} THEN 100\n         WHEN lower(r.full_name) = lower({{param:name}}) THEN 100\n         ELSE 70\n       END AS match_score,\n       r.full_name,\n       coalesce(p.name, 'unassigned') AS program,\n       r.status AS registration_status,\n       coalesce(s.status, 'NO_SESSION') AS session_status,\n       coalesce(s.is_report_ready, false) AS report_ready\n  FROM registrations r\n  LEFT JOIN programs p ON p.id = r.program_id\n  LEFT JOIN assessment_sessions s ON s.registration_id = r.id\n WHERE r.is_deleted IS NOT TRUE\n   AND (\n        r.full_name ILIKE '%' || {{param:name}} || '%'\n     OR r.id = {{param:registration_id}}\n   )\n   AND {{scope:corporate_account_id}}\n ORDER BY r.id, s.created_at DESC NULLS LAST"
+      "sqlTemplate": "SELECT DISTINCT ON (r.id)\n       r.id AS id,\n       r.full_name AS label,\n       coalesce(p.name, 'no program') || ' · ' || coalesce(s.status, 'no session yet') AS detail,\n       CASE\n         WHEN r.id = {{param:registration_id}} THEN 100\n         WHEN lower(r.full_name) = lower({{param:name}}) THEN 100\n         ELSE 70\n       END AS match_score,\n       r.full_name,\n       r.user_id,\n       coalesce(p.name, 'unassigned') AS program,\n       r.status AS registration_status,\n       coalesce(s.status, 'NO_SESSION') AS session_status,\n       coalesce(s.is_report_ready, false) AS report_ready\n  FROM registrations r\n  LEFT JOIN programs p ON p.id = r.program_id\n  LEFT JOIN assessment_sessions s ON s.registration_id = r.id\n WHERE r.is_deleted IS NOT TRUE\n   AND (\n        r.full_name ILIKE '%' || {{param:name}} || '%'\n     OR r.id = {{param:registration_id}}\n   )\n   AND {{scope:corporate_account_id}}\n ORDER BY r.id, s.created_at DESC NULLS LAST"
     },
     {
       "name": "list_candidates",
@@ -358,6 +363,618 @@
         }
       ],
       "sqlTemplate": "SELECT DISTINCT ON (ar.id)\n       ar.id,\n       ar.report_number,\n       (ar.report_url IS NOT NULL) AS report_available,\n       ar.generated_at,\n       coalesce(p.name, 'unassigned') AS program\n  FROM assessment_reports ar\n  JOIN assessment_sessions s ON s.id = ar.assessment_session_id\n  LEFT JOIN programs p ON p.id = s.program_id\n WHERE {{scope:user_id}}\n ORDER BY ar.id DESC"
+    },
+    {
+      "name": "my_level_scores",
+      "category": "student",
+      "kind": "read",
+      "description": "For the signed-in student: their result at every assessment level, one row per level in order — the level name, what it measures, whether it is completed, the score out of the maximum with a percentage, and when it was finished. Levels 1 and 2 carry a numeric score; levels 3 and 4 are pattern-based and show completion rather than a mark.",
+      "whenToUse": [
+        "what are my scores",
+        "how did I do in each level",
+        "what did I get for level 2",
+        "show me my assessment results",
+        "which levels have I finished"
+      ],
+      "whenNotToUse": [
+        "Not for the D/I/S/C breakdown of level 1 — that is my_behavioural_profile.",
+        "Not for the five agile values behind the level 2 total — that is my_agile_index.",
+        "Only ever returns the caller's own data."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "a.user_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (l.sort_order)\n       l.level_number,\n       l.name AS level,\n       l.pattern_type AS measures,\n       a.status,\n       a.total_score AS score,\n       nullif(coalesce(nullif(a.max_score_snapshot, 0), l.max_score), 0) AS out_of,\n       round(100.0 * a.total_score\n             / nullif(coalesce(nullif(a.max_score_snapshot, 0), l.max_score), 0), 1) AS percent,\n       a.sincerity_class,\n       pt.blended_style_name AS dominant_style,\n       a.started_at,\n       a.completed_at\n  FROM assessment_attempts a\n  JOIN assessment_levels l ON l.id = a.assessment_level_id\n  LEFT JOIN personality_traits pt ON pt.id = a.dominant_trait_id\n WHERE {{scope:user_id}}\n ORDER BY l.sort_order, a.completed_at DESC NULLS LAST, a.id DESC"
+    },
+    {
+      "name": "my_behavioural_profile",
+      "category": "student",
+      "kind": "read",
+      "description": "For the signed-in student: the level 1 behavioural breakdown — their Dominance, Influence, Steadiness and Compliance scores, the total, and the blended style those four produce (such as \"Creative Thinker\") with what that style means.",
+      "whenToUse": [
+        "what is my DISC score",
+        "what is my personality style",
+        "what are my dominance and influence scores",
+        "explain my behavioural profile"
+      ],
+      "whenNotToUse": [
+        "Not for every level at once — that is my_level_scores.",
+        "Not for the agile values from level 2 — that is my_agile_index.",
+        "Only ever returns the caller's own data."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "s.user_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (ar.id)\n       ar.report_number,\n       (ar.disc_scores->>'D')::numeric AS dominance,\n       (ar.disc_scores->>'I')::numeric AS influence,\n       (ar.disc_scores->>'S')::numeric AS steadiness,\n       (ar.disc_scores->>'C')::numeric AS compliance,\n       (ar.disc_scores->>'total')::numeric AS total,\n       pt.blended_style_name AS style,\n       pt.blended_style_desc AS what_the_style_means,\n       ar.overall_sincerity,\n       ar.generated_at\n  FROM assessment_reports ar\n  JOIN assessment_sessions s ON s.id = ar.assessment_session_id\n  LEFT JOIN personality_traits pt ON pt.id = ar.dominant_trait_id\n WHERE ar.disc_scores IS NOT NULL AND ar.disc_scores <> '{}'::jsonb\n   AND {{scope:user_id}}\n ORDER BY ar.id DESC"
+    },
+    {
+      "name": "my_agile_index",
+      "category": "student",
+      "kind": "read",
+      "description": "For the signed-in student: the level 2 Agile Compatibility Index — their Commitment, Focus, Openness, Respect and Courage scores, the total, and which band that total falls in (Agile Naturalist, Adaptive, Learner or Resistant) with the interpretation of that band.",
+      "whenToUse": [
+        "what is my agile score",
+        "what is my ACI",
+        "what band am I in",
+        "how did I do on commitment and courage"
+      ],
+      "whenNotToUse": [
+        "Not for the DISC letters — that is my_behavioural_profile.",
+        "Not for every level at once — that is my_level_scores.",
+        "Only ever returns the caller's own data."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "s.user_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (ar.id)\n       (ar.agile_scores->>'Commitment')::numeric AS commitment,\n       (ar.agile_scores->>'Focus')::numeric      AS focus,\n       (ar.agile_scores->>'Openness')::numeric   AS openness,\n       (ar.agile_scores->>'Respect')::numeric    AS respect,\n       (ar.agile_scores->>'Courage')::numeric    AS courage,\n       (ar.agile_scores->>'total')::numeric      AS total,\n       b.level_name AS band,\n       b.compatibility_tag AS band_summary,\n       b.interpretation AS what_the_band_means,\n       ar.generated_at\n  FROM assessment_reports ar\n  JOIN assessment_sessions s ON s.id = ar.assessment_session_id\n  LEFT JOIN aci_score_bands b\n         ON b.is_active AND b.is_deleted IS NOT TRUE\n        AND (ar.agile_scores->>'total')::numeric BETWEEN b.min_score AND b.max_score\n WHERE ar.agile_scores IS NOT NULL AND ar.agile_scores <> '{}'::jsonb\n   AND {{scope:user_id}}\n ORDER BY ar.id DESC"
+    },
+    {
+      "name": "my_iat_patterns",
+      "category": "student",
+      "kind": "read",
+      "description": "For the signed-in student: their level 3 association-test result, one row per comparison. Each row gives how much longer they took on one pairing than the other, whether that hesitation was low, moderate or strong, their error rate, and which pairing was the slower one.",
+      "whenToUse": [
+        "what did level 3 show",
+        "what were my IAT results",
+        "where did I hesitate",
+        "what are my association patterns"
+      ],
+      "whenNotToUse": [
+        "Level 3 has no numeric score, so this is not a \"what did I get\" answer — for scores use my_level_scores.",
+        "Only ever returns the caller's own data."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "m.user_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (m.module_order, im.id)\n       im.display_name AS comparison,\n       m.pattern_label AS hesitation,\n       round(m.speed_gap_ms) AS hesitation_ms,\n       round(m.compatible_average_ms) AS faster_pairing_ms,\n       round(m.incompatible_average_ms) AS slower_pairing_ms,\n       round(m.error_rate, 1) AS error_percent,\n       im.slowed_on_description AS slower_pairing_was,\n       m.status,\n       m.completed_at\n  FROM iat_attempt_modules m\n  JOIN iat_modules im ON im.id = m.module_id\n WHERE {{scope:user_id}}\n ORDER BY m.module_order, im.id, m.id DESC"
+    },
+    {
+      "name": "candidate_level_scores",
+      "category": "corporate",
+      "kind": "read",
+      "description": "One candidate's result at every assessment level, one row per level in order — the level name, what it measures, status, score out of the maximum with a percentage, and when it was finished. Takes a registration id from find_candidate. Only returns candidates in your own company.",
+      "whenToUse": [
+        "what were Priya's scores",
+        "how did this candidate do in each level",
+        "show me the level breakdown for <candidate>",
+        "what did they get for level 1"
+      ],
+      "whenNotToUse": [
+        "Not for finding the candidate in the first place — use find_candidate, then this.",
+        "Not for the D/I/S/C or agile detail — those are candidate_behavioural_profile.",
+        "Not for a whole cohort — use level_completion_funnel."
+      ],
+      "parameters": {
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id, as returned by find_candidate. Ask for the candidate by name first if you do not have it.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (l.sort_order)\n       r.full_name AS candidate,\n       l.level_number,\n       l.name AS level,\n       l.pattern_type AS measures,\n       a.status,\n       a.total_score AS score,\n       nullif(coalesce(nullif(a.max_score_snapshot, 0), l.max_score), 0) AS out_of,\n       round(100.0 * a.total_score\n             / nullif(coalesce(nullif(a.max_score_snapshot, 0), l.max_score), 0), 1) AS percent,\n       a.sincerity_class,\n       pt.blended_style_name AS dominant_style,\n       a.started_at,\n       a.completed_at\n  FROM assessment_attempts a\n  JOIN registrations r ON r.id = a.registration_id\n  JOIN assessment_levels l ON l.id = a.assessment_level_id\n  LEFT JOIN personality_traits pt ON pt.id = a.dominant_trait_id\n WHERE r.is_deleted IS NOT TRUE\n   AND a.registration_id = {{param:registration_id}}\n   AND {{scope:corporate_account_id}}\n ORDER BY l.sort_order, a.completed_at DESC NULLS LAST, a.id DESC"
+    },
+    {
+      "name": "candidate_behavioural_profile",
+      "category": "corporate",
+      "kind": "read",
+      "description": "One candidate's level 1 behavioural breakdown — Dominance, Influence, Steadiness and Compliance with the total, and the blended style those produce with what it means. Takes a registration id from find_candidate. Only returns candidates in your own company.",
+      "whenToUse": [
+        "what is this candidate's DISC profile",
+        "what personality style did <candidate> get",
+        "show me the behavioural breakdown for <candidate>"
+      ],
+      "whenNotToUse": [
+        "Not for the agile values — that is candidate_agile_index.",
+        "Not for every level at once — that is candidate_level_scores."
+      ],
+      "parameters": {
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id, as returned by find_candidate. Ask for the candidate by name first if you do not have it.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (ar.id)\n       ar.report_number,\n       (ar.disc_scores->>'D')::numeric AS dominance,\n       (ar.disc_scores->>'I')::numeric AS influence,\n       (ar.disc_scores->>'S')::numeric AS steadiness,\n       (ar.disc_scores->>'C')::numeric AS compliance,\n       (ar.disc_scores->>'total')::numeric AS total,\n       pt.blended_style_name AS style,\n       pt.blended_style_desc AS what_the_style_means,\n       ar.overall_sincerity,\n       ar.generated_at\n  FROM assessment_reports ar\n  JOIN assessment_sessions s ON s.id = ar.assessment_session_id\n  JOIN registrations r ON r.id = s.registration_id\n  LEFT JOIN personality_traits pt ON pt.id = ar.dominant_trait_id\n WHERE ar.disc_scores IS NOT NULL AND ar.disc_scores <> '{}'::jsonb\n   AND r.is_deleted IS NOT TRUE\n   AND s.registration_id = {{param:registration_id}}\n   AND {{scope:corporate_account_id}}\n ORDER BY ar.id DESC"
+    },
+    {
+      "name": "candidate_agile_index",
+      "category": "corporate",
+      "kind": "read",
+      "description": "One candidate's level 2 Agile Compatibility Index — Commitment, Focus, Openness, Respect and Courage with the total, and which band the total falls in with its interpretation. Takes a registration id from find_candidate. Only returns candidates in your own company.",
+      "whenToUse": [
+        "what is this candidate's agile score",
+        "which ACI band is <candidate> in",
+        "how did they score on openness and courage"
+      ],
+      "whenNotToUse": [
+        "Not for the DISC letters — that is candidate_behavioural_profile.",
+        "Not for every level at once — that is candidate_level_scores."
+      ],
+      "parameters": {
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id, as returned by find_candidate. Ask for the candidate by name first if you do not have it.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (ar.id)\n       (ar.agile_scores->>'Commitment')::numeric AS commitment,\n       (ar.agile_scores->>'Focus')::numeric      AS focus,\n       (ar.agile_scores->>'Openness')::numeric   AS openness,\n       (ar.agile_scores->>'Respect')::numeric    AS respect,\n       (ar.agile_scores->>'Courage')::numeric    AS courage,\n       (ar.agile_scores->>'total')::numeric      AS total,\n       b.level_name AS band,\n       b.compatibility_tag AS band_summary,\n       b.interpretation AS what_the_band_means,\n       ar.generated_at\n  FROM assessment_reports ar\n  JOIN assessment_sessions s ON s.id = ar.assessment_session_id\n  JOIN registrations r ON r.id = s.registration_id\n  LEFT JOIN aci_score_bands b\n         ON b.is_active AND b.is_deleted IS NOT TRUE\n        AND (ar.agile_scores->>'total')::numeric BETWEEN b.min_score AND b.max_score\n WHERE ar.agile_scores IS NOT NULL AND ar.agile_scores <> '{}'::jsonb\n   AND r.is_deleted IS NOT TRUE\n   AND s.registration_id = {{param:registration_id}}\n   AND {{scope:corporate_account_id}}\n ORDER BY ar.id DESC"
+    },
+    {
+      "name": "candidate_iat_patterns",
+      "category": "corporate",
+      "kind": "read",
+      "description": "One candidate's level 3 association-test result, one row per comparison: how much longer they took on one pairing than the other, whether that hesitation was low, moderate or strong, the error rate, and which pairing was slower. Takes a registration id from find_candidate. Only returns candidates in your own company.",
+      "whenToUse": [
+        "what did level 3 show for this candidate",
+        "where did <candidate> hesitate",
+        "show me the association patterns for <candidate>"
+      ],
+      "whenNotToUse": [
+        "Level 3 produces no numeric score — for scores use candidate_level_scores."
+      ],
+      "parameters": {
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id, as returned by find_candidate. Ask for the candidate by name first if you do not have it.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (m.module_order, im.id)\n       im.display_name AS comparison,\n       m.pattern_label AS hesitation,\n       round(m.speed_gap_ms) AS hesitation_ms,\n       round(m.compatible_average_ms) AS faster_pairing_ms,\n       round(m.incompatible_average_ms) AS slower_pairing_ms,\n       round(m.error_rate, 1) AS error_percent,\n       im.slowed_on_description AS slower_pairing_was,\n       m.status,\n       m.completed_at\n  FROM iat_attempt_modules m\n  JOIN iat_modules im ON im.id = m.module_id\n  JOIN registrations r ON r.id = m.registration_id\n WHERE r.is_deleted IS NOT TRUE\n   AND m.registration_id = {{param:registration_id}}\n   AND {{scope:corporate_account_id}}\n ORDER BY m.module_order, im.id, m.id DESC"
+    },
+    {
+      "name": "level_completion_funnel",
+      "category": "corporate",
+      "kind": "read",
+      "description": "How your company's candidates are distributed across the assessment levels: for each level reached, how many attempts are completed, in progress, not started or expired, how many distinct candidates it covers, and the average score of the completed ones. Shows where a cohort is stuck.",
+      "whenToUse": [
+        "where are our candidates getting stuck",
+        "how many have finished each level",
+        "give me a level by level breakdown",
+        "what is the average score at level 2"
+      ],
+      "whenNotToUse": [
+        "Not for one candidate — use candidate_level_scores.",
+        "Not for overall session status — use candidate_status_counts.",
+        "A level no candidate has reached does not appear at all."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT l.level_number,\n       l.name AS level,\n       l.pattern_type AS measures,\n       count(DISTINCT a.id) FILTER (WHERE a.status = 'COMPLETED')   AS completed,\n       count(DISTINCT a.id) FILTER (WHERE a.status = 'IN_PROGRESS') AS in_progress,\n       count(DISTINCT a.id) FILTER (WHERE a.status = 'NOT_STARTED') AS not_started,\n       count(DISTINCT a.id) FILTER (WHERE a.status IN ('EXPIRED', 'PARTIALLY_EXPIRED')) AS expired,\n       count(DISTINCT a.registration_id) AS candidates,\n       round(avg(a.total_score) FILTER (WHERE a.status = 'COMPLETED'), 1) AS average_score\n  FROM assessment_attempts a\n  JOIN registrations r ON r.id = a.registration_id\n  JOIN assessment_levels l ON l.id = a.assessment_level_id\n WHERE r.is_deleted IS NOT TRUE\n   AND {{scope:corporate_account_id}}\n GROUP BY l.level_number, l.name, l.pattern_type, l.sort_order\n ORDER BY l.sort_order"
+    },
+    {
+      "name": "attempts_expiring_soon",
+      "category": "corporate",
+      "kind": "read",
+      "description": "Candidates in your company whose current assessment level has a deadline coming up and is not finished, soonest first, with how many hours are left. Use this to chase people before they run out of time.",
+      "whenToUse": [
+        "who is about to run out of time",
+        "which assessments expire this week",
+        "who should I chase",
+        "anything expiring in the next 48 hours"
+      ],
+      "whenNotToUse": [
+        "Not for deadlines that have already passed — that is stalled_attempts.",
+        "Not for one candidate — use candidate_level_scores."
+      ],
+      "parameters": {
+        "within_hours": {
+          "type": "integer",
+          "description": "How far ahead to look, in hours. Defaults to 72 (three days).",
+          "required": false,
+          "min": 1,
+          "max": 8760
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (a.id)\n       r.full_name AS candidate,\n       l.level_number,\n       l.name AS level,\n       a.status,\n       coalesce(a.must_finish_by, a.expires_at) AS deadline,\n       round(extract(epoch FROM coalesce(a.must_finish_by, a.expires_at) - now()) / 3600) AS hours_left\n  FROM assessment_attempts a\n  JOIN registrations r ON r.id = a.registration_id\n  JOIN assessment_levels l ON l.id = a.assessment_level_id\n WHERE r.is_deleted IS NOT TRUE\n   AND a.status IN ('NOT_STARTED', 'IN_PROGRESS', 'PARTIALLY_EXPIRED')\n   AND coalesce(a.must_finish_by, a.expires_at)\n       BETWEEN now() AND now() + make_interval(hours => coalesce({{param:within_hours}}::int, 72))\n   AND {{scope:corporate_account_id}}\n ORDER BY a.id, deadline"
+    },
+    {
+      "name": "stalled_attempts",
+      "category": "corporate",
+      "kind": "read",
+      "description": "Candidates in your company whose deadline for a level has already passed without them finishing it, most overdue first, with how many days ago the deadline was. These are the people who need a new window rather than a reminder.",
+      "whenToUse": [
+        "who missed their deadline",
+        "who has run out of time",
+        "which assessments expired without being finished",
+        "who needs their assessment reopened"
+      ],
+      "whenNotToUse": [
+        "Not for deadlines still in the future — that is attempts_expiring_soon.",
+        "Not for a status breakdown — use candidate_status_counts."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (a.id)\n       r.full_name AS candidate,\n       l.level_number,\n       l.name AS level,\n       a.status,\n       coalesce(a.must_finish_by, a.expires_at) AS deadline_was,\n       round(extract(epoch FROM now() - coalesce(a.must_finish_by, a.expires_at)) / 86400) AS days_overdue\n  FROM assessment_attempts a\n  JOIN registrations r ON r.id = a.registration_id\n  JOIN assessment_levels l ON l.id = a.assessment_level_id\n WHERE r.is_deleted IS NOT TRUE\n   AND a.status <> 'COMPLETED'\n   AND coalesce(a.must_finish_by, a.expires_at) < now()\n   AND {{scope:corporate_account_id}}\n ORDER BY a.id, deadline_was"
+    },
+    {
+      "name": "corporate_credit_history",
+      "category": "corporate",
+      "kind": "read",
+      "description": "Your company's assessment credit movements, most recent first: whether each entry added (CREDIT) or used (DEBIT) credits, how many, the reason, and the amount and payment status where one applies. Use this for \"where did our credits go\"; for the number remaining use corporate_credit_balance.",
+      "whenToUse": [
+        "where did our credits go",
+        "show me our credit history",
+        "when did we last buy credits",
+        "what have we spent credits on"
+      ],
+      "whenNotToUse": [
+        "Not for the current balance — that is corporate_credit_balance.",
+        "Not for candidates — use list_candidates."
+      ],
+      "parameters": {
+        "entry_type": {
+          "type": "string",
+          "description": "Restrict to credits added or credits used. Leave unset for both.",
+          "required": false,
+          "enum": [
+            "CREDIT",
+            "DEBIT"
+          ]
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "cl.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (cl.id)\n       cl.created_at AS entry_date,\n       cl.ledger_type AS entry_type,\n       cl.credit_delta AS credits,\n       cl.reason,\n       cl.per_credit_cost,\n       cl.total_amount,\n       cl.payment_status,\n       cl.paid_on\n  FROM corporate_credit_ledger cl\n WHERE (cast({{param:entry_type}} AS text) IS NULL OR cl.ledger_type = {{param:entry_type}})\n   AND {{scope:corporate_account_id}}\n ORDER BY cl.id DESC"
+    },
+    {
+      "name": "platform_level_throughput",
+      "category": "admin",
+      "kind": "read",
+      "description": "Administrator view of how much assessment has been completed at each level over a recent window, across every company: completions, distinct people, average score where the level has one, and the average minutes taken. Use for platform health and capacity.",
+      "whenToUse": [
+        "how many assessments were completed at each level this month",
+        "how long does level 2 take on average",
+        "platform throughput by level",
+        "how many people finished level 3 in the last 90 days"
+      ],
+      "whenNotToUse": [
+        "Not scoped to one company — for that use level_completion_funnel as that company.",
+        "Not for session status overall — that is platform_assessment_overview.",
+        "Available to administrators only."
+      ],
+      "parameters": {
+        "days": {
+          "type": "integer",
+          "description": "How far back to look, in days. Defaults to 30.",
+          "required": false,
+          "min": 1,
+          "max": 3650
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "ADMIN"
+      ],
+      "scopeFilters": [],
+      "sqlTemplate": "SELECT l.level_number,\n       l.name AS level,\n       l.pattern_type AS measures,\n       count(DISTINCT a.id) AS completed,\n       count(DISTINCT a.user_id) AS people,\n       round(avg(a.total_score), 1) AS average_score,\n       round(avg(extract(epoch FROM a.completed_at - a.started_at) / 60), 1) AS average_minutes\n  FROM assessment_attempts a\n  JOIN assessment_levels l ON l.id = a.assessment_level_id\n WHERE a.status = 'COMPLETED'\n   AND a.completed_at >= now() - make_interval(days => coalesce({{param:days}}::int, 30))\n GROUP BY l.level_number, l.name, l.pattern_type, l.sort_order\n ORDER BY l.sort_order"
+    },
+    {
+      "name": "generate_my_report",
+      "category": "student",
+      "kind": "write",
+      "description": "For the signed-in student: prepare their assessment report and hand back a download link. Takes a little while — the report is rendered in the background and the link arrives when it is ready. Only ever produces the caller's own report.",
+      "whenToUse": [
+        "download my report",
+        "send me my report",
+        "can I get a copy of my assessment report",
+        "generate my report"
+      ],
+      "whenNotToUse": [
+        "Not for checking whether a report already exists — that is my_report.",
+        "Not for scores — those are my_level_scores.",
+        "Only ever produces the caller's own report."
+      ],
+      "parameters": {
+        "report_type": {
+          "type": "string",
+          "description": "Which report to produce. Leave unset for the standard full report.",
+          "required": false,
+          "enum": [
+            "full",
+            "short",
+            "level1"
+          ],
+          "default": "full"
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "confirmation",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "r.user_id"
+        }
+      ],
+      "sqlTemplate": null,
+      "writeScope": "reports.generate",
+      "requiresConfirmation": false,
+      "httpRequest": {
+        "service": "reports",
+        "method": "GET",
+        "path": "/report/generate/student/{{scope:user_id}}?reportType={{param:report_type}}",
+        "precondition": {
+          "sqlTemplate": "SELECT 1 FROM registrations r WHERE r.is_deleted IS NOT TRUE AND {{scope:user_id}}",
+          "denyMessage": "I could not find a registration for you, so there is no report to prepare."
+        },
+        "poll": {
+          "urlFrom": "statusUrl",
+          "statusField": "status",
+          "successWhen": [
+            "COMPLETED"
+          ],
+          "failureWhen": [
+            "ERROR"
+          ],
+          "intervalMs": 2000,
+          "maxAttempts": 30
+        },
+        "result": {
+          "link": {
+            "from": "downloadUrl",
+            "label": "Download the report"
+          },
+          "expose": [
+            {
+              "from": "password",
+              "label": "Report password"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "generate_candidate_report",
+      "category": "corporate",
+      "kind": "write",
+      "description": "Prepare a candidate's assessment report and hand back a download link. Takes the candidate's user id, which find_candidate returns — look the person up by name first. The report is rendered in the background and the link arrives when it is ready. Only candidates in your own company can be generated for.",
+      "whenToUse": [
+        "download the report for Priya Sharma",
+        "generate a report for this candidate",
+        "get me <candidate>'s report",
+        "send me the report for <candidate>"
+      ],
+      "whenNotToUse": [
+        "Not for checking whether a report is ready — find_candidate already says so.",
+        "Not for a whole cohort at once.",
+        "Look the candidate up by name first; this takes the id that lookup returns."
+      ],
+      "parameters": {
+        "user_id": {
+          "type": "integer",
+          "description": "The candidate's user id, as returned by find_candidate. Never guess this — look the candidate up by name first.",
+          "required": true,
+          "resolvedIdentifier": true
+        },
+        "report_type": {
+          "type": "string",
+          "description": "Which report to produce. Leave unset for the standard full report.",
+          "required": false,
+          "enum": [
+            "full",
+            "short",
+            "level1"
+          ],
+          "default": "full"
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "confirmation",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": null,
+      "writeScope": "reports.generate",
+      "requiresConfirmation": false,
+      "httpRequest": {
+        "service": "reports",
+        "method": "GET",
+        "path": "/report/generate/student/{{param:user_id}}?reportType={{param:report_type}}",
+        "precondition": {
+          "sqlTemplate": "SELECT 1 FROM registrations r WHERE r.user_id = {{param:user_id}} AND r.is_deleted IS NOT TRUE AND {{scope:corporate_account_id}}",
+          "denyMessage": "That candidate is not in your account."
+        },
+        "poll": {
+          "urlFrom": "statusUrl",
+          "statusField": "status",
+          "successWhen": [
+            "COMPLETED"
+          ],
+          "failureWhen": [
+            "ERROR"
+          ],
+          "intervalMs": 2000,
+          "maxAttempts": 30
+        },
+        "result": {
+          "link": {
+            "from": "downloadUrl",
+            "label": "Download the report"
+          },
+          "expose": [
+            {
+              "from": "password",
+              "label": "Report password"
+            }
+          ]
+        }
+      }
     }
   ]
 }

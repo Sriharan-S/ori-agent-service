@@ -167,10 +167,31 @@ export async function playgroundView() {
   const input = el('textarea', { rows: 2, placeholder: 'Ask the agent…', class: 'pg__input' });
   const sendBtn = button('Send', { variant: 'primary', iconName: 'play' });
 
-  const session = { conversationId: null, streaming: false, firstMessage: true };
+  /**
+   * `turns` mirrors the server's transcript in order, so an edit knows what
+   * comes after the turn being changed and can take it off the screen at the
+   * same moment the service discards it. Without that the two would disagree:
+   * the browser would still show answers to a question that no longer exists.
+   */
+  const session = { conversationId: null, streaming: false, firstMessage: true, turns: [] };
 
-  const send = async () => {
-    const message = input.value.trim();
+  /** Drop a turn and everything after it, from the screen. */
+  const truncateFrom = (turn) => {
+    const index = session.turns.indexOf(turn);
+    if (index < 0) return;
+    for (const dropped of session.turns.slice(index)) dropped.bubble.remove();
+    session.turns.length = index;
+  };
+
+  /**
+   * Send a message.
+   *
+   * `replaceFrom` is the turn being edited. The service rewinds to it before
+   * reading the history, so the re-run sees the conversation as it was up to
+   * that point and nothing after.
+   */
+  const send = async (text, { replaceFrom = null } = {}) => {
+    const message = (text ?? input.value).trim();
     if (!message || session.streaming) return;
 
     const key = apiKey.value.trim();
@@ -178,15 +199,18 @@ export async function playgroundView() {
     keyStore.set(state.applicationId, key);
 
     if (session.firstMessage) { transcript.replaceChildren(); session.firstMessage = false; }
-    input.value = '';
+    if (text === undefined) input.value = '';
+    if (replaceFrom) truncateFrom(replaceFrom);
 
-    addBubble(transcript, 'user', message);
-    const bubbleRef = addBubble(transcript, 'agent', '');
+    const userTurn = addBubble(transcript, 'user', message, { onEdit: startEdit });
+    const bubbleRef = addBubble(transcript, 'agent', '', { onRetry: retry });
+    session.turns.push(userTurn, bubbleRef);
     const showTrace = traceToggle.checked;
 
     session.streaming = true;
     sendBtn.disabled = true;
     input.disabled = true;
+    refreshActions();
 
     try {
       await streamChat({
@@ -194,6 +218,7 @@ export async function playgroundView() {
         key,
         trace: showTrace,
         conversationId: session.conversationId,
+        replaceFromMessageId: replaceFrom?.messageId ?? null,
         identity: isJwt
           ? { mode: 'jwt', token: jwtToken.value.trim() }
           : {
@@ -202,23 +227,108 @@ export async function playgroundView() {
               role: roleSelect.value,
               scopes: collectScopes(scopeInputs),
             },
-        onEvent: (event) => handleEvent(event, { bubbleRef, showTrace, session }),
+        onEvent: (event) => handleEvent(event, { bubbleRef, userTurn, showTrace, session }),
       });
     } catch (error) {
-      bubbleRef.stageLine.hidden = true;
+      bubbleRef.failStages();
       mount(bubbleRef.bubble, notice(error.message, 'bad'));
     } finally {
       session.streaming = false;
       sendBtn.disabled = false;
       input.disabled = false;
       input.focus();
+      refreshActions();
       transcript.scrollTop = transcript.scrollHeight;
     }
   };
 
-  sendBtn.onclick = send;
+  /**
+   * Turn a sent message back into an editable one.
+   *
+   * The original text stays on screen until Save, so cancelling is genuinely
+   * free — nothing has been discarded server-side at this point either.
+   */
+  function startEdit(turn) {
+    if (session.streaming || turn.editing) return;
+    turn.editing = true;
+
+    const draft = el('textarea', { rows: 2, class: 'pg__input pg__edit-input' });
+    draft.value = turn.text;
+
+    const finish = () => {
+      turn.editing = false;
+      editor.remove();
+      turn.body.hidden = false;
+      refreshActions();
+    };
+
+    const save = button('Send', {
+      variant: 'primary',
+      size: 'sm',
+      onclick: () => {
+        const next = draft.value.trim();
+        if (!next) return;
+        finish();
+        // `turn` is removed by truncateFrom inside send, along with every turn
+        // after it.
+        void send(next, { replaceFrom: turn });
+      },
+    });
+
+    const editor = el('div', { class: 'pg__edit' },
+      draft,
+      el('div', { class: 'pg__edit-actions' },
+        save,
+        button('Cancel', { size: 'sm', onclick: finish })));
+
+    draft.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') { event.preventDefault(); finish(); }
+      if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); save.click(); }
+    });
+
+    turn.body.hidden = true;
+    turn.bubble.append(editor);
+    refreshActions();
+    draft.focus();
+    draft.setSelectionRange(draft.value.length, draft.value.length);
+  }
+
+  /**
+   * Only the last agent answer offers "Try again", and only a recorded user
+   * turn offers "Edit" — an id the service never sent back is one it cannot
+   * rewind to, so offering the button would be a lie.
+   */
+  function refreshActions() {
+    const lastAgent = [...session.turns].reverse().find((turn) => turn.who === 'agent');
+
+    for (const turn of session.turns) {
+      const editable =
+        turn.who === 'user' && turn.messageId != null && !session.streaming && !turn.editing;
+      const retryable = turn === lastAgent && !session.streaming && lastUserBefore(turn)?.messageId != null;
+
+      turn.actions.hidden = !(editable || retryable);
+      if (turn.editButton) turn.editButton.hidden = !editable;
+      if (turn.retryButton) turn.retryButton.hidden = !retryable;
+    }
+  }
+
+  const lastUserBefore = (turn) => {
+    const index = session.turns.indexOf(turn);
+    if (index < 0) return null;
+    for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+      if (session.turns[cursor].who === 'user') return session.turns[cursor];
+    }
+    return null;
+  };
+
+  const retry = (turn) => {
+    const source = lastUserBefore(turn);
+    if (source) void send(source.text, { replaceFrom: source });
+  };
+
+  sendBtn.onclick = () => void send();
   input.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send(); }
+    if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send(); }
   });
 
   const reset = button('New conversation', {
@@ -226,6 +336,7 @@ export async function playgroundView() {
     onclick: () => {
       session.conversationId = null;
       session.firstMessage = true;
+      session.turns.length = 0;
       transcript.replaceChildren(empty('New conversation', 'Ask something to begin.', null, 'chat'));
     },
   });
@@ -247,7 +358,9 @@ export async function playgroundView() {
 
 // ── Streaming ─────────────────────────────────────────────────────────────────
 
-async function streamChat({ message, key, trace, conversationId, identity, onEvent }) {
+async function streamChat({
+  message, key, trace, conversationId, replaceFromMessageId, identity, onEvent,
+}) {
   const headers = {
     'content-type': 'application/json',
     'x-api-key': key,
@@ -266,7 +379,12 @@ async function streamChat({ message, key, trace, conversationId, identity, onEve
   const response = await fetch('/v1/chat/stream', {
     method: 'POST',
     headers,
-    body: JSON.stringify({ message, trace, conversationId: conversationId ?? undefined }),
+    body: JSON.stringify({
+      message,
+      trace,
+      conversationId: conversationId ?? undefined,
+      replaceFromMessageId: replaceFromMessageId ?? undefined,
+    }),
   });
 
   if (!response.ok || !response.body) {
@@ -313,13 +431,21 @@ function parseFrame(frame) {
   }
 }
 
-/** What each phase is called while it is happening. */
-const STAGE_LABELS = {
-  understanding: 'Reading the question…',
-  selecting: 'Choosing what to look up…',
-  retrieving: 'Fetching the data…',
-  composing: 'Writing the answer…',
-};
+/**
+ * The phases of a run, in the order they happen.
+ *
+ * Shown all at once from the moment the question is sent, rather than one label
+ * replacing another: a fast run used to flash through four states in 200ms and
+ * leave nothing behind, so "what did it actually do" was unanswerable the
+ * moment it finished. Listing them up front also makes a stall legible — the
+ * phase it is stuck in is the one still spinning.
+ */
+const STAGES = [
+  ['understanding', 'Reading the question'],
+  ['selecting', 'Choosing what to look up'],
+  ['retrieving', 'Fetching the data'],
+  ['composing', 'Writing the answer'],
+];
 
 function handleEvent(event, ctx) {
   const { name, data } = event;
@@ -329,22 +455,41 @@ function handleEvent(event, ctx) {
     return;
   }
 
-  // Phases arrive on the user channel, so even a key without the trace scope can
-  // show honest progress instead of a spinner.
+  // The id each turn was stored under. Held on the bubble so "edit this one"
+  // has something the service can rewind to.
+  if (name === 'turn.recorded') {
+    const target = data.role === 'user' ? ctx.userTurn : ctx.bubbleRef;
+    if (target) target.messageId = data.messageId ?? null;
+    return;
+  }
+
+  // Phases arrive on the user channel, so even a key without the trace scope
+  // can show honest progress instead of a spinner.
   if (name === 'stage') {
-    const label = STAGE_LABELS[data.stage];
-    if (label) {
-      ctx.bubbleRef.stageLine.hidden = false;
-      ctx.bubbleRef.stageLine.replaceChildren(
-        el('span', { class: 'pg__spinner' }), el('span', {}, label));
-    }
+    ctx.bubbleRef.enterStage(data.stage);
     return;
   }
 
   if (name === 'message.delta') {
-    ctx.bubbleRef.stageLine.hidden = true;
+    // Writing has begun, so everything before it is done — the composing stage
+    // has no completion event of its own.
+    ctx.bubbleRef.enterStage('composing');
     ctx.bubbleRef.append(data.text ?? '');
     ctx.bubbleRef.bubble.closest('.pg__transcript').scrollTop = 1e9;
+    return;
+  }
+
+  // Something an action produced that has to arrive intact. It is also in the
+  // answer text, but rendered here as a control so the link is one click rather
+  // than a URL to select — and so it is obvious it came from the action rather
+  // than from the model's prose.
+  if (name === 'artifact') {
+    mount(ctx.bubbleRef.bubble, el('div', { class: 'pg__artifact' },
+      icon(data.url ? 'link' : 'key', 14),
+      data.url
+        ? el('a', { href: data.url, target: '_blank', rel: 'noopener noreferrer' }, data.label)
+        : frag(el('span', {}, `${data.label}: `),
+            el('code', {}, data.value ?? ''))));
     return;
   }
 
@@ -352,7 +497,7 @@ function handleEvent(event, ctx) {
   // prompted it. Showing them makes the "asks instead of guessing" behaviour
   // visible rather than just a sentence.
   if (name === 'clarification') {
-    ctx.bubbleRef.stageLine.hidden = true;
+    ctx.bubbleRef.finishStages();
     ctx.bubbleRef.set(data.message ?? '');
     if (Array.isArray(data.candidates) && data.candidates.length) {
       mount(ctx.bubbleRef.bubble, el('div', { class: 'pg__candidates' },
@@ -366,7 +511,7 @@ function handleEvent(event, ctx) {
   }
 
   if (name === 'run.completed') {
-    ctx.bubbleRef.stageLine.hidden = true;
+    ctx.bubbleRef.finishStages(data.latencyMs);
     if (data.responseType && data.responseType !== 'answer') {
       mount(ctx.bubbleRef.bubble, el('div', { class: 'pg__tag' }, statusBadge(data.responseType)));
     }
@@ -374,33 +519,49 @@ function handleEvent(event, ctx) {
   }
 
   if (name === 'error') {
-    ctx.bubbleRef.stageLine.hidden = true;
+    ctx.bubbleRef.failStages();
     mount(ctx.bubbleRef.bubble, notice(data.message || 'The run failed.', 'bad'));
     return;
   }
 
   if (!ctx.showTrace) return;
 
+  // The router's read of the question, in its own words. First thing that
+  // happens and the first thing worth seeing, so it goes above the plan.
+  if (name === 'router.decision' && data.reason) {
+    ctx.bubbleRef.think(`Understood as a ${data.intent} request — ${data.reason}`);
+    return;
+  }
+
   // ── Trace: how the functions were chosen ──────────────────────────────────
   //
   // Rendered as structure rather than a log line, because the question it has to
   // answer is "did the model pick this, or was it the only option".
   if (name === 'plan.created') {
+    if (data.reasoning) ctx.bubbleRef.think(data.reasoning);
+
     ctx.bubbleRef.traceList.hidden = false;
     const chosen = (data.calls ?? []).map((c) => c.name);
     const considered = data.considered ?? [];
 
     mount(ctx.bubbleRef.traceList,
       el('div', { class: 'pg__phase' },
-        el('strong', {}, data.isFallback ? 'No model chose — fallback' : 'The model chose'),
+        el('strong', {},
+          data.isFallback
+            ? 'No model chose — fallback'
+            : `The model chose from ${considered.length} function(s)`),
         el('div', { class: 'pg__chips' },
           ...considered.map((fnName) =>
             el('span', {
               class: `pg__chip ${chosen.includes(fnName) ? 'is-chosen' : ''}`,
               title: chosen.includes(fnName) ? 'chosen' : 'offered but not chosen',
             }, fnName))),
-        data.reasoning
-          ? el('div', { class: 'pg__reason' }, `“${data.reasoning}”`)
+        // One function offered is not a choice. Saying so stops a fallback
+        // reading like a decision — which is exactly how a catalogue with only
+        // the demo function in it looked like the model picking it.
+        considered.length === 1
+          ? el('div', { class: 'pg__reason' },
+              'Only one function was available, so this was not really a choice.')
           : null,
         ...(data.calls ?? []).map((call) =>
           el('div', { class: 'pg__call' },
@@ -413,7 +574,6 @@ function handleEvent(event, ctx) {
   }
 
   const simple = {
-    'router.decision': () => `Understood as: ${data.intent}`,
     'function.started': () => `Running ${data.name}…`,
     'function.completed': () =>
       `${data.name} → ${data.status}` +
@@ -442,36 +602,153 @@ function handleEvent(event, ctx) {
  * These answers are a few hundred characters, so rebuilding a small fragment per
  * delta costs nothing measurable.
  */
-function addBubble(transcript, who, text) {
+function addBubble(transcript, who, text, { onEdit, onRetry } = {}) {
   const body = el('div', { class: 'pg__text' });
   const traceList = el('div', { class: 'pg__trace', hidden: true });
-  const stageLine = el('div', { class: 'pg__stage', hidden: true });
 
-  const bubble = el('div', { class: `pg__bubble pg__bubble--${who}` },
+  // Every phase, listed from the start. `rows` keeps the nodes so a stage
+  // change is a class swap rather than a re-render, which would restart the
+  // spinner animation on every event.
+  const rows = new Map();
+  const stageTrack = el('div', { class: 'pg__stages', hidden: who !== 'agent' });
+
+  for (const [key, label] of STAGES) {
+    const time = el('span', { class: 'pg__stage-ms' });
+    const row = el('div', { class: 'pg__stage-row is-pending' },
+      el('span', { class: 'pg__stage-mark' }),
+      el('span', { class: 'pg__stage-label' }, label),
+      time);
+    rows.set(key, { row, time });
+    stageTrack.append(row);
+  }
+
+  const thinking = el('div', { class: 'pg__thinking', hidden: true });
+
+  // Hidden until the caller decides the turn can actually be acted on — a user
+  // turn needs the id the service assigned it, and only the last answer is
+  // worth retrying.
+  const actions = el('div', { class: 'pg__actions', hidden: true });
+
+  const turn = {
+    who,
+    /** Set from `turn.recorded`; null means the service cannot rewind to it. */
+    messageId: null,
+    editing: false,
+    get text() { return this._raw ?? ''; },
+    _raw: text,
+    append(chunk) { this._raw = (this._raw ?? '') + chunk; setMarkdown(body, this._raw); },
+    set(value) { this._raw = value; setMarkdown(body, value); },
+    body,
+    actions,
+    traceList,
+    stageTrack,
+    thinking,
+    editButton: null,
+    retryButton: null,
+    bubble: null,
+
+    /** Marks a phase as running, and everything before it as finished. */
+    _startedAt: null,
+    _active: null,
+    enterStage(key) {
+      if (!rows.has(key) || this._active === key) return;
+
+      const now = performance.now();
+      if (this._startedAt === null) this._startedAt = now;
+
+      // Close whatever was running. Stages arrive in order, so anything above
+      // the new one is finished whether or not its own event was seen — a run
+      // that answers from cache can skip one entirely.
+      let reached = false;
+      for (const [name, node] of rows) {
+        if (name === key) {
+          reached = true;
+          node.row.className = 'pg__stage-row is-active';
+          node.startedAt = now;
+          continue;
+        }
+        if (!reached) {
+          if (node.row.classList.contains('is-active')) {
+            node.time.textContent = `${Math.round(now - (node.startedAt ?? now))}ms`;
+          }
+          node.row.className = 'pg__stage-row is-done';
+        }
+      }
+
+      this._active = key;
+    },
+
+    /** Everything finished. Left on screen — the timings are the point. */
+    finishStages(latencyMs) {
+      const now = performance.now();
+      for (const node of rows.values()) {
+        if (node.row.classList.contains('is-active')) {
+          node.time.textContent = `${Math.round(now - (node.startedAt ?? now))}ms`;
+        }
+        node.row.className = 'pg__stage-row is-done';
+      }
+      this._active = 'done';
+      if (latencyMs !== undefined) {
+        stageTrack.append(el('div', { class: 'pg__stage-total' }, `${latencyMs}ms total`));
+      }
+    },
+
+    /** Stops the spinner on the phase that failed, so it stays visible. */
+    failStages() {
+      for (const node of rows.values()) {
+        if (node.row.classList.contains('is-active')) {
+          node.row.className = 'pg__stage-row is-failed';
+        }
+      }
+      this._active = 'done';
+    },
+
+    /** A line of the agent's own reasoning, as it arrives. */
+    think(line) {
+      thinking.hidden = false;
+      mount(thinking, el('div', { class: 'pg__thought' }, line));
+    },
+  };
+
+  if (onEdit) {
+    turn.editButton = button('Edit', {
+      size: 'sm',
+      iconName: 'edit',
+      title: 'Change this message and run the conversation again from here',
+      onclick: () => onEdit(turn),
+    });
+    mount(actions, turn.editButton);
+  }
+
+  if (onRetry) {
+    turn.retryButton = button('Try again', {
+      size: 'sm',
+      iconName: 'refresh',
+      title: 'Ask the same question again, discarding this answer',
+      onclick: () => onRetry(turn),
+    });
+    mount(actions, turn.retryButton);
+  }
+
+  turn.bubble = el('div', { class: `pg__bubble pg__bubble--${who}` },
     el('div', { class: 'pg__who' },
       el('span', { class: 'avatar', style: who === 'agent' ? '' : 'background:var(--bg-subtle);color:var(--text-muted)' },
         who === 'agent' ? 'O' : 'U'),
-      el('span', {}, who === 'agent' ? 'Agent' : 'You')),
-    who === 'agent' ? stageLine : null,
+      el('span', {}, who === 'agent' ? 'Agent' : 'You'),
+      actions),
+    who === 'agent' ? stageTrack : null,
+    who === 'agent' ? thinking : null,
     who === 'agent' ? traceList : null,
     body);
 
   if (who === 'user') body.textContent = text;
   else setMarkdown(body, text);
 
-  transcript.append(bubble);
+  transcript.append(turn.bubble);
   transcript.scrollTop = transcript.scrollHeight;
 
   // `text` is the running source; `body` is its rendered form.
-  return {
-    get text() { return this._raw ?? ''; },
-    _raw: text,
-    append(chunk) { this._raw = (this._raw ?? '') + chunk; setMarkdown(body, this._raw); },
-    set(value) { this._raw = value; setMarkdown(body, value); },
-    traceList,
-    stageLine,
-    bubble,
-  };
+  return turn;
 }
 
 function collectScopes(inputs) {
