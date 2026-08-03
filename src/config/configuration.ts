@@ -73,6 +73,13 @@ export interface AppConfig {
     maxCandidatesReturned: number;
     registryCacheTtlMs: number;
     maxPlannedCalls: number;
+    /**
+     * Turns of the agent loop before it gives up. Each turn is one model call
+     * plus at most `maxPlannedCalls` function calls, so this bounds both the
+     * latency and the token cost of a single question. Four covers
+     * lookup → act → check, with one spare for a corrected retry.
+     */
+    maxAgentSteps: number;
     /** Upper bound on a single agent run, streaming included. */
     runTimeoutMs: number;
   };
@@ -193,6 +200,7 @@ export function loadConfiguration(): AppConfig {
       maxCandidatesReturned: num(env.MAX_CANDIDATES_RETURNED, 8),
       registryCacheTtlMs: num(env.REGISTRY_CACHE_TTL_MS, 30000),
       maxPlannedCalls: num(env.MAX_PLANNED_CALLS, 3),
+      maxAgentSteps: num(env.MAX_AGENT_STEPS, 4),
       runTimeoutMs: num(env.RUN_TIMEOUT_MS, 120000),
     },
     rateLimit: {

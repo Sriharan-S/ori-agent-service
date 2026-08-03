@@ -8,6 +8,11 @@ import {
   type PendingDisambiguation,
 } from '../memory/conversation.service';
 import { RegistryService } from '../registry/registry.service';
+import { formatGrounding } from '../knowledge/knowledge-prompt';
+import {
+  RetrievalService,
+  type Passage,
+} from '../knowledge/retrieval.service';
 import { ExecutorService } from './executor.service';
 import { ORI_STATIC_FALLBACKS } from './ori-persona';
 import type {
@@ -18,7 +23,7 @@ import type {
   ExecutionPlan,
 } from './orchestrator.types';
 import { NOOP_SINK } from './orchestrator.types';
-import { PlannerService } from './planner.service';
+import { AgentLoopService } from './agent-loop.service';
 import { ReflectorService } from './reflector.service';
 import { RouterService } from './router.service';
 import { SynthesizerService } from './synthesizer.service';
@@ -46,10 +51,11 @@ export class OrchestratorService {
     private readonly conversations: ConversationService,
     private readonly registry: RegistryService,
     private readonly router: RouterService,
-    private readonly planner: PlannerService,
+    private readonly agentLoop: AgentLoopService,
     private readonly executor: ExecutorService,
     private readonly reflector: ReflectorService,
     private readonly synthesizer: SynthesizerService,
+    private readonly retrieval: RetrievalService,
     private readonly audit: AuditLoggerService,
   ) {}
 
@@ -299,10 +305,20 @@ export class OrchestratorService {
     run: AgentRun,
     emit: AgentEventSink,
   ): Promise<AgentResponse> {
-    const catalogue = await this.registry.getCatalogueFor(
-      run.context.application.id,
-      run.context.role,
-    );
+    // "What can you do" answered from a function list alone reads like a menu.
+    // The uploaded documentation is what lets it describe the product instead.
+    const [catalogue, passages] = await Promise.all([
+      this.registry.getCatalogueFor(
+        run.context.application.id,
+        run.context.role,
+      ),
+      this.retrieval.search(
+        run.context.application.id,
+        run.context.role.name,
+        run.message,
+        3,
+      ),
+    ]);
 
     const message = await this.synthesizer.conversational(
       run.message,
@@ -310,6 +326,7 @@ export class OrchestratorService {
       run.history,
       run.context.application.id,
       emit,
+      passages,
     );
 
     return {
@@ -344,65 +361,98 @@ export class OrchestratorService {
       functions: catalogue.map((entry) => entry.name),
     });
 
-    // Phase one: the model chooses. It sees the catalogue and the question, and
-    // nothing else — no schema, no rows. Announced separately from retrieval so
-    // a caller can show the two phases as two phases.
     emit({ type: 'stage', channel: 'user', stage: 'selecting' });
 
-    const plan = await this.planner.plan(
-      run.message,
-      catalogue,
-      run.history,
-      run.context.role.name,
+    // One search per run, shared by everything that needs it. The loop gets it
+    // as vocabulary for choosing a function, the synthesizer gets it as
+    // background for explaining a result, and the decline path answers from it
+    // outright — three uses, one query, and the same role filter on all of them.
+    const passages = await this.retrieval.search(
       run.context.application.id,
+      run.context.role.name,
+      run.message,
     );
 
-    emit({
-      type: 'plan.created',
-      channel: 'trace',
-      reasoning: plan.reasoning,
-      considered: catalogue.map((entry) => entry.name),
-      isFallback: plan.isFallback,
-      calls: plan.calls.map((call) => ({
-        name: call.functionName,
-        params: call.params,
-        reason: call.reason,
-      })),
-    });
+    // The loop chooses, runs, reads the result, and chooses again. It emits its
+    // own stage change when the first function actually starts, so the two
+    // phases still read as two phases even though they now interleave.
+    const loop = await this.agentLoop.run(
+      run,
+      catalogue,
+      formatGrounding(passages),
+      emit,
+    );
 
-    if (plan.calls.length === 0) {
-      this.audit.recordRejection(run.context, `no plan: ${plan.reasoning}`);
-      const message =
-        catalogue.length === 0
-          ? ORI_STATIC_FALLBACKS.nothingConfigured
-          : plan.fallbackCause === 'llm-unavailable'
-            ? ORI_STATIC_FALLBACKS.llmUnavailable
-            : ORI_STATIC_FALLBACKS.notUnderstood;
+    if (loop.outcomes.length > 0) {
+      return this.respondTo(run, loop.outcomes, emit, passages);
+    }
 
-      emit({ type: 'message.delta', channel: 'user', text: message });
+    // Nothing ran. Which of the four reasons it was decides both what the user
+    // is told and where an operator should go looking.
+    this.audit.recordRejection(run.context, `no calls: stop=${loop.stop}`);
+
+    // A deliberate decline is the one case where a canned string is the wrong
+    // answer. The model read the question and understood that nothing fits, so
+    // the useful reply says what *would* have worked — or, when the uploaded
+    // documentation covers the question, simply answers it. The loop's own
+    // wording is discarded either way: it is written for a machine and has
+    // never been vetted for a reader.
+    if (loop.stop === 'declined' && catalogue.length > 0) {
+      emit({ type: 'stage', channel: 'user', stage: 'composing' });
+
+      const written =
+        passages.length > 0
+          ? await this.synthesizer.fromKnowledge(
+              run.message,
+              passages,
+              run.history,
+              run.context.application.id,
+              emit,
+            )
+          : await this.synthesizer.conversational(
+              run.message,
+              catalogue.map((entry) => entry.description),
+              run.history,
+              run.context.application.id,
+              emit,
+            );
 
       return {
         conversationId: run.conversationKey,
         runId: run.context.runId,
         type: 'answer',
-        message,
+        message: written,
         functionsUsed: [],
         requestId: run.context.requestId,
       };
     }
 
-    // Phase two: run what was chosen. The model has no part in this — the SQL
-    // was written by an administrator and validated by Postgres.
-    emit({ type: 'stage', channel: 'user', stage: 'retrieving' });
+    const message =
+      catalogue.length === 0
+        ? ORI_STATIC_FALLBACKS.nothingConfigured
+        : loop.stop === 'llm-unavailable'
+          ? ORI_STATIC_FALLBACKS.llmUnavailable
+          : loop.stop === 'exhausted'
+            ? ORI_STATIC_FALLBACKS.gaveUp
+            : ORI_STATIC_FALLBACKS.cannotDo;
 
-    const outcomes = await this.executor.execute(plan, run, emit);
-    return this.respondTo(run, outcomes, emit);
+    emit({ type: 'message.delta', channel: 'user', text: message });
+
+    return {
+      conversationId: run.conversationKey,
+      runId: run.context.runId,
+      type: 'answer',
+      message,
+      functionsUsed: [],
+      requestId: run.context.requestId,
+    };
   }
 
   private async respondTo(
     run: AgentRun,
     outcomes: CallOutcome[],
     emit: AgentEventSink,
+    passages: Passage[] = [],
   ): Promise<AgentResponse> {
     const functionsUsed = outcomes.map((outcome) => outcome.functionName);
     const reflection = this.reflector.reflect(outcomes);
@@ -500,6 +550,7 @@ export class OrchestratorService {
       run.history,
       run.context.application.id,
       emit,
+      passages,
     );
 
     return {

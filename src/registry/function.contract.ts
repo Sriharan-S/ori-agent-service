@@ -216,9 +216,21 @@ export interface PlannerFacingFunction {
       description: string;
       required: boolean;
       enum?: readonly string[];
+      /**
+       * Carried through to the model, not just to the validator.
+       *
+       * Without it the model has no way to know an id must come from an earlier
+       * lookup, so it invents one — a literal
+       * `"{registration_id_from_find_candidate}"` was the observed failure. The
+       * validator rejected that, correctly, but only after the model had already
+       * committed to a plan it could not fulfil.
+       */
+      resolvedIdentifier?: boolean;
     }
   >;
   requiredOneOf: string[][];
+  /** `read` may be called freely; `write` changes something. */
+  kind: FunctionKind;
 }
 
 export function toPlannerFacing(
@@ -232,6 +244,7 @@ export function toPlannerFacing(
       description: param.description,
       required: param.required === true,
       ...(param.enum ? { enum: param.enum } : {}),
+      ...(param.resolvedIdentifier ? { resolvedIdentifier: true } : {}),
     };
   }
 
@@ -243,6 +256,7 @@ export function toPlannerFacing(
     whenNotToUse: definition.whenNotToUse,
     parameters,
     requiredOneOf: definition.requiredOneOf,
+    kind: definition.kind,
   };
 }
 

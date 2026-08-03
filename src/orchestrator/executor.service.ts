@@ -60,7 +60,7 @@ export class ExecutorService {
     const { independent, dependent } = partition(plan.calls);
 
     const settled = await Promise.allSettled(
-      independent.map((call) => this.runOne(call, run, emit)),
+      independent.map((call) => this.runCall(call, run, emit)),
     );
 
     const outcomes: CallOutcome[] = [];
@@ -103,13 +103,20 @@ export class ExecutorService {
         );
         continue;
       }
-      outcomes.push(await this.runOne(resolved, run, emit));
+      outcomes.push(await this.runCall(resolved, run, emit));
     }
 
     return outcomes;
   }
 
-  private async runOne(
+  /**
+   * One call, with every guard applied.
+   *
+   * Public because the agent loop drives calls one at a time — it has to see
+   * each result before it can choose the next — and it must not be able to
+   * reach the function body by any route that skips the checks below.
+   */
+  async runCall(
     call: PlannedCall,
     run: AgentRun,
     emit: AgentEventSink,
@@ -183,12 +190,20 @@ export class ExecutorService {
 
     const validation = this.params.validate(definition, call.params);
     if (!validation.ok) {
+      // Two different sentences for two different readers. The specific one
+      // ("find_user needs at least one of: email, userid.") is what the loop
+      // needs in order to correct itself, and it used to be handed straight to
+      // the user — who saw a function name, a parameter list, and underscores
+      // that markdown rendered as italics. They now get the vague one, and only
+      // if the loop never recovers.
+      const detail = validation.errors.map((error) => error.message).join(' ');
+
       return this.finish(
         call,
         definition.version,
         {
           status: 'error',
-          message: validation.errors.map((error) => error.message).join(' '),
+          message: "I couldn't look that up with what I had to go on.",
           retryable: false,
         },
         run,
@@ -196,6 +211,7 @@ export class ExecutorService {
         'invalid_params',
         validation.errors.map((error) => `${error.kind}:${error.param}`).join(','),
         definition.kind,
+        detail,
       );
     }
 
@@ -206,6 +222,7 @@ export class ExecutorService {
     let afterState: Record<string, unknown> | undefined;
     let artifacts: ResultArtifact[] | undefined;
     let rowCount = 0;
+    let operatorDetail: string | undefined;
 
     try {
       if (definition.kind === 'read') {
@@ -222,11 +239,9 @@ export class ExecutorService {
         rowCount = result.status === 'single' ? 1 : 0;
       }
     } catch (error) {
-      this.logger.error(
-        `${definition.name} failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+      const detail = error instanceof Error ? error.message : String(error);
+      this.logger.error(`${definition.name} failed: ${detail}`);
+      operatorDetail = detail;
       result = {
         status: 'error',
         message: 'That step failed unexpectedly.',
@@ -276,6 +291,7 @@ export class ExecutorService {
       result,
       durationMs,
       ...(artifacts && artifacts.length > 0 ? { artifacts } : {}),
+      ...(operatorDetail ? { operatorDetail } : {}),
     };
   }
 
@@ -289,6 +305,8 @@ export class ExecutorService {
     status: AuditStatus,
     detail: string,
     kind: 'read' | 'write',
+    /** Operator-facing specifics. Defaults to `detail`. Never shown to a user. */
+    operatorDetail = detail,
   ): Promise<CallOutcome> {
     const durationMs = Date.now() - startedAt;
 
@@ -315,6 +333,7 @@ export class ExecutorService {
       params: call.params,
       result,
       durationMs,
+      ...(operatorDetail ? { operatorDetail } : {}),
     };
   }
 

@@ -16,6 +16,7 @@ import { views } from './views.js';
 import { functionEditor } from './function-editor.js';
 import { guideView } from './guide.js';
 import { playgroundView } from './playground.js';
+import { knowledgeView } from './knowledge.js';
 
 export const state = {
   user: null,
@@ -69,6 +70,7 @@ const NAV = [
     title: 'Configure',
     items: [
       { id: 'functions', label: 'Functions', icon: 'functions', countKey: 'functions' },
+      { id: 'knowledge', label: 'Knowledge', icon: 'guide' },
       { id: 'roles', label: 'Roles', icon: 'roles' },
       { id: 'models', label: 'Models', icon: 'models', countKey: 'models' },
       { id: 'applications', label: 'Applications', icon: 'apps' },
@@ -91,6 +93,7 @@ const TITLES = {
   functions: 'Functions',
   'function-new': 'New function',
   'function-edit': 'Edit function',
+  knowledge: 'Knowledge',
   roles: 'Roles',
   models: 'Models',
   applications: 'Applications',
@@ -360,6 +363,7 @@ function themeToggle() {
 const PAGES = {
   ...views,
   playground: () => playgroundView(),
+  knowledge: () => knowledgeView(),
   'function-new': () => functionEditor(null),
   'function-edit': (params) => functionEditor(params.name),
   guide: (params) => guideView(params.section),

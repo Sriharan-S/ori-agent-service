@@ -1,15 +1,24 @@
 import {
   LlmError,
+  parseToolArguments,
   type ChatMessage,
   type CompletionOptions,
   type CompletionResult,
+  type ToolCall,
 } from './llm.types';
 import type { ResolvedModel } from './model-registry.service';
+
+interface RawToolCall {
+  id?: string;
+  type?: string;
+  function?: { name?: string; arguments?: string | null };
+}
 
 interface ChatCompletionResponse {
   choices?: Array<{
     message?: {
       content?: string | null;
+      tool_calls?: RawToolCall[] | null;
       /**
        * Reasoning models put their chain of thought here and the answer in
        * `content`. Never used as the answer — it is read only to explain an
@@ -33,6 +42,69 @@ interface StreamChunk {
     finish_reason?: string | null;
   }>;
   usage?: { prompt_tokens?: number; completion_tokens?: number };
+}
+
+/**
+ * Messages in the wire shape.
+ *
+ * `name` is deliberately never sent. Groq rejects `messages[].name` outright,
+ * and it carries nothing the `tool_call_id` pairing does not already establish
+ * — so omitting it costs nothing and keeps one more provider working.
+ */
+function toWireMessages(messages: ChatMessage[]): unknown[] {
+  return messages.map((message) => {
+    if (message.role === 'tool') {
+      return {
+        role: 'tool',
+        content: message.content,
+        tool_call_id: message.toolCallId,
+      };
+    }
+
+    if (message.role === 'assistant' && message.toolCalls?.length) {
+      return {
+        role: 'assistant',
+        // An assistant turn that only called tools has no prose. The field must
+        // still be present — some providers reject a message without one.
+        content: message.content,
+        tool_calls: message.toolCalls.map((call) => ({
+          id: call.id,
+          type: 'function',
+          function: {
+            name: call.name,
+            arguments: JSON.stringify(call.arguments),
+          },
+        })),
+      };
+    }
+
+    return { role: message.role, content: message.content };
+  });
+}
+
+function toToolCalls(raw: RawToolCall[] | null | undefined): ToolCall[] {
+  if (!raw?.length) return [];
+
+  const calls: ToolCall[] = [];
+
+  for (let index = 0; index < raw.length; index += 1) {
+    const entry = raw[index]!;
+    const name = entry.function?.name;
+    if (!name) continue;
+
+    const parsed = parseToolArguments(entry.function?.arguments);
+    calls.push({
+      // Some OpenAI-compatible servers omit the id. The pairing between an
+      // assistant tool call and its result is positional then, and a synthesised
+      // id keeps that pairing expressible rather than dropping the call.
+      id: entry.id ?? `call_${index}`,
+      name,
+      arguments: parsed.arguments,
+      ...(parsed.malformed ? { malformed: parsed.malformed } : {}),
+    });
+  }
+
+  return calls;
 }
 
 /**
@@ -63,8 +135,11 @@ export class OpenAiCompatibleProvider {
     const payload = (await response.json()) as ChatCompletionResponse;
     const choice = payload.choices?.[0];
     const text = choice?.message?.content ?? '';
+    const toolCalls = toToolCalls(choice?.message?.tool_calls);
 
-    if (!text.trim()) {
+    // An assistant turn that only calls a tool has no prose, and that is the
+    // normal successful shape once tools are in play — not an empty completion.
+    if (!text.trim() && toolCalls.length === 0) {
       throw new LlmError(
         `${this.name} returned an empty completion${describeEmpty(payload)}`,
         this.name,
@@ -75,6 +150,8 @@ export class OpenAiCompatibleProvider {
 
     return {
       text,
+      toolCalls,
+      finishReason: choice?.finish_reason ?? null,
       provider: this.name,
       model: this.model.modelId,
       latencyMs: Date.now() - startedAt,
@@ -169,6 +246,8 @@ export class OpenAiCompatibleProvider {
 
     return {
       text,
+      toolCalls: [],
+      finishReason: null,
       provider: this.name,
       model: this.model.modelId,
       latencyMs: Date.now() - startedAt,
@@ -193,6 +272,12 @@ export class OpenAiCompatibleProvider {
           method: 'POST',
           signal: controller.signal,
           headers: {
+            // Operator headers first, so the built-ins below always win. A
+            // gateway needs its own header *alongside* the provider's
+            // authorization, never instead of it — and a typo here must not be
+            // able to silently strip authentication. Setting `authorization`
+            // deliberately is still possible by leaving the model's key blank.
+            ...this.model.extraHeaders,
             'content-type': 'application/json',
             ...(this.model.apiKey
               ? { authorization: `Bearer ${this.model.apiKey}` }
@@ -200,10 +285,19 @@ export class OpenAiCompatibleProvider {
           },
           body: JSON.stringify({
             model: this.model.modelId,
-            messages,
+            messages: toWireMessages(messages),
             temperature: options.temperature ?? this.model.temperature,
             max_tokens: options.maxTokens ?? this.model.maxOutputTokens,
             stream,
+            ...(options.tools?.length
+              ? {
+                  tools: options.tools.map((tool) => ({
+                    type: 'function',
+                    function: tool,
+                  })),
+                  tool_choice: options.toolChoice ?? 'auto',
+                }
+              : {}),
           }),
         },
       );

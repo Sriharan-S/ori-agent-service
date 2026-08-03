@@ -27,17 +27,36 @@ const ENGINE_COLUMNS = new Set([
 ]);
 
 /**
- * Keys that are internal identifiers. Kept out of the evidence entirely: a user
- * asking about their assessment does not want to be told a row id, and once a
- * model has seen one it tends to quote it.
+ * Values that must never reach a language model at all, in any mode.
  *
- * `id` itself is kept — a lookup's resolved id is sometimes genuinely the
- * answer ("what is my report number") — but anything ending `_id` is a foreign
- * key, which never is.
+ * Not a presentation choice — a credential in a prompt is a credential in a log
+ * and in a completion. Separate from the identifier rule below because that one
+ * is about what reads well, and this one is not negotiable.
  */
-function isInternalIdentifier(key: string): boolean {
-  return /_id$/.test(key) || key === 'uuid' || /(^|_)(cognito_sub|password|hash|token|secret|url)$/.test(key);
+function isSecret(key: string): boolean {
+  return /(^|_)(cognito_sub|password|hash|token|secret|url)$/.test(key);
 }
+
+/*
+ * Identifiers used to be stripped here, and it caused the same bug twice.
+ *
+ * `find_candidate` returns `id` (a registration) and `user_id` (a person). With
+ * `user_id` removed, both readers saw only `Id: 582`:
+ *
+ *   - The agent loop passed it to an action wanting a user id, and generated
+ *     one candidate's report under another candidate's name.
+ *   - The synthesizer, asked "what is Sriharan's user id", answered 582 — the
+ *     registration id, which belongs to a different person as a user id.
+ *
+ * Both are the same mistake: withholding a fact to control how it is presented,
+ * and getting a confidently wrong answer instead of a tidy one. Presentation is
+ * the persona's job, and the persona already says not to volunteer an id.
+ *
+ * Nothing is lost by showing them. Evidence is built from rows that RBAC and
+ * scope binding have already filtered, so every value in it is one the caller
+ * is entitled to see. Secrets are a different matter and are still removed
+ * unconditionally — see `isSecret`.
+ */
 
 /** `session_status` → `Session status`. */
 export function humaniseKey(key: string): string {
@@ -87,7 +106,9 @@ function humaniseValue(value: unknown): string | null {
   }
 
   if (Array.isArray(value)) {
-    const parts = value.map(humaniseValue).filter((part): part is string => part !== null);
+    const parts = value
+      .map((entry) => humaniseValue(entry))
+      .filter((part): part is string => part !== null);
     return parts.length > 0 ? parts.join(', ') : null;
   }
 
@@ -101,13 +122,13 @@ function humaniseValue(value: unknown): string | null {
   return null;
 }
 
-/** `Full name: Priya Sharma · Program: College Students` */
+/** `Full name: Priya Sharma · User id: 596 · Program: College Students` */
 function describeRecord(record: Record<string, unknown>): string {
   const parts: string[] = [];
 
   for (const [key, raw] of Object.entries(record)) {
     if (ENGINE_COLUMNS.has(key)) continue;
-    if (isInternalIdentifier(key)) continue;
+    if (isSecret(key)) continue;
 
     const value = humaniseValue(raw);
     if (value === null) continue;

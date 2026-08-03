@@ -87,20 +87,49 @@ describe('evidence presentation', () => {
       expect(presented).not.toContain('2026-01-29T03');
     });
 
-    it('drops foreign keys and secrets, which are never the answer', () => {
+    it('drops secrets, which must never reach a model at all', () => {
       const presented = presentRecord({
         full_name: 'Priya Sharma',
-        corporate_account_id: 13,
-        assessment_session_id: 359,
         cognito_sub: 'e1a3ad7a-6041-70c3',
+        password_hash: 'argon2id$v=19$x',
         report_url: 'https://example.com/x.pdf',
       })!;
 
       expect(presented).toContain('Priya Sharma');
-      expect(presented).not.toContain('13');
-      expect(presented).not.toContain('359');
       expect(presented).not.toContain('e1a3ad7a');
+      expect(presented).not.toContain('argon2id');
       expect(presented).not.toContain('example.com');
+    });
+
+    it('keeps identifiers, labelled, so the right one can be chosen', () => {
+      /*
+       * This assertion used to be the opposite, and that is what caused two
+       * wrong-record bugs.
+       *
+       * `find_candidate` returns `id` (a registration) and `user_id` (a
+       * person). With foreign keys stripped, both readers saw only `Id: 582`:
+       * the agent loop passed it to an action wanting a user id and generated
+       * one candidate's report under another candidate's name, and the
+       * synthesizer, asked for a user id, answered with the registration id.
+       *
+       * Evidence is built from rows RBAC and scope binding have already
+       * filtered, so every value in it is one the caller may see. Keeping ids
+       * out was a presentation preference, and presentation is the persona's
+       * job — enforcing it by withholding facts produced confident wrong
+       * answers instead of tidy ones.
+       */
+      const presented = presentRecord({
+        full_name: 'Sriharan S2',
+        id: 582,
+        user_id: 596,
+        corporate_account_id: 13,
+      })!;
+
+      expect(presented).toContain('Id: 582');
+      expect(presented).toContain('User id: 596');
+      expect(presented).toContain('Corporate account id: 13');
+      // Labelled, so "the user id" is answerable without guessing.
+      expect(presented).not.toMatch(/\buser_id\b/);
     });
 
     it('drops engine-only columns', () => {
@@ -128,7 +157,11 @@ describe('evidence presentation', () => {
     });
 
     it('returns null when a record holds nothing worth saying', () => {
-      expect(presentRecord({ user_id: 5, ori_total: 2 })).toBeNull();
+      // Engine columns and secrets only — nothing a reader or the loop could
+      // use. An id on its own is now genuinely something worth saying, so it no
+      // longer counts as empty.
+      expect(presentRecord({ ori_total: 2, match_score: 90 })).toBeNull();
+      expect(presentRecord({ password_hash: 'x' })).toBeNull();
       expect(presentRecord(null)).toBeNull();
     });
   });

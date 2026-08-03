@@ -1,9 +1,11 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
   Get,
   Inject,
+  NotFoundException,
   Param,
   ParseIntPipe,
   Post,
@@ -11,9 +13,13 @@ import {
   Query,
   Req,
   Res,
+  UploadedFile,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import type { Request, Response } from 'express';
+import { DocumentService } from '../knowledge/document.service';
 import { CONFIG, type AppConfig } from '../config/configuration';
 import { ApiKeyService } from '../auth/api-key.service';
 import type { ApiKeyScope } from '../auth/identity';
@@ -23,6 +29,7 @@ import {
   ModelRegistryService,
   type ModelInput,
 } from '../llm/model-registry.service';
+import { defaultPrefixesFor } from '../llm/embedding-prefixes';
 import { ConversationService } from '../memory/conversation.service';
 import { RegistryService } from '../registry/registry.service';
 import type { FunctionStatus } from '../registry/function.contract';
@@ -48,6 +55,44 @@ import { DatabaseInfoService } from './database-info.service';
 import { DEMO_FUNCTION_NAME } from '../management/demo-function';
 
 /**
+ * Ceiling on an uploaded document.
+ *
+ * Generous for a document and small enough that a handful of concurrent
+ * uploads cannot exhaust the heap — the file is buffered in memory, because
+ * writing it to disk would give this service a second kind of state to operate,
+ * and the extracted text is what actually gets stored.
+ */
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+
+/** The subset of multer's file we use. Avoids a dependency on its types. */
+interface UploadedDocument {
+  buffer: Buffer;
+  originalname: string;
+  mimetype: string;
+  size: number;
+}
+
+/**
+ * Roles from a multipart field.
+ *
+ * A multipart body has no arrays, so the client sends JSON in a text field. A
+ * field that will not parse falls back to "everyone", which is the same default
+ * as an absent one — the alternative is failing an upload over a formatting
+ * detail the operator cannot see.
+ */
+function parseRoles(raw: string | undefined): string[] {
+  if (!raw) return ['*'];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((role): role is string => typeof role === 'string')
+      : ['*'];
+  } catch {
+    return ['*'];
+  }
+}
+
+/**
  * The dashboard's own API.
  *
  * Session-authenticated and cross-tenant: an operator picks which application
@@ -71,6 +116,7 @@ export class AdminController {
     private readonly llm: LlmService,
     private readonly apiKeys: ApiKeyService,
     private readonly conversations: ConversationService,
+    private readonly documents: DocumentService,
   ) {}
 
   // ── Session ────────────────────────────────────────────────────────────────
@@ -285,6 +331,144 @@ export class AdminController {
   async revokeKey(@Param('id', ParseIntPipe) id: number) {
     await this.apiKeys.revoke(id);
     return { revoked: true };
+  }
+
+  // ── Knowledge ──────────────────────────────────────────────────────────────
+
+  /** Documents, plus whether embeddings and pgvector are in play. */
+  @Get('applications/:id/knowledge')
+  @UseGuards(AdminSessionGuard)
+  async listDocuments(@Param('id', ParseIntPipe) id: number) {
+    const [documents, status] = await Promise.all([
+      this.documents.list(id),
+      this.documents.status(id),
+    ]);
+    return { documents, status };
+  }
+
+  @Get('applications/:id/knowledge/:documentId')
+  @UseGuards(AdminSessionGuard)
+  async getDocument(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('documentId', ParseIntPipe) documentId: number,
+  ) {
+    const document = await this.documents.get(id, documentId);
+    if (!document) throw new NotFoundException('No such document.');
+    return { document };
+  }
+
+  /**
+   * Pasted text.
+   *
+   * Separate from the upload route because it is the common case and does not
+   * need a multipart body — "here is what the agent should know" is more often
+   * typed than attached.
+   */
+  @Post('applications/:id/knowledge/text')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async createTextDocument(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() body: { title?: string; content?: string; allowedRoles?: string[] },
+    @CurrentAdmin() admin: { id: number },
+  ) {
+    return {
+      document: await this.documents.createFromText(
+        id,
+        {
+          title: body.title ?? '',
+          content: body.content ?? '',
+          allowedRoles: body.allowedRoles ?? ['*'],
+        },
+        admin.id,
+      ),
+    };
+  }
+
+  /**
+   * An uploaded file.
+   *
+   * The size ceiling is enforced by the interceptor rather than checked after
+   * the fact, so an oversized upload is refused while it is still arriving
+   * instead of after the whole thing has been buffered into memory.
+   */
+  @Post('applications/:id/knowledge/upload')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  @UseInterceptors(
+    FileInterceptor('file', { limits: { fileSize: MAX_UPLOAD_BYTES } }),
+  )
+  async uploadDocument(
+    @Param('id', ParseIntPipe) id: number,
+    @UploadedFile() file: UploadedDocument | undefined,
+    @Body() body: { title?: string; allowedRoles?: string },
+    @CurrentAdmin() admin: { id: number },
+  ) {
+    if (!file) throw new BadRequestException('No file was uploaded.');
+
+    return {
+      document: await this.documents.createFromFile(
+        id,
+        {
+          title: body.title ?? '',
+          buffer: file.buffer,
+          filename: file.originalname,
+          mimeType: file.mimetype,
+          // Multipart carries no arrays, so the roles arrive as JSON in a field.
+          allowedRoles: parseRoles(body.allowedRoles),
+        },
+        admin.id,
+      ),
+    };
+  }
+
+  @Put('applications/:id/knowledge/:documentId/roles')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async setDocumentRoles(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('documentId', ParseIntPipe) documentId: number,
+    @Body() body: { allowedRoles?: string[] },
+  ) {
+    const document = await this.documents.setRoles(
+      id,
+      documentId,
+      body.allowedRoles ?? ['*'],
+    );
+    if (!document) throw new NotFoundException('No such document.');
+    return { document };
+  }
+
+  /** Re-chunk and re-embed. Used after an embedding model is added or changed. */
+  @Post('applications/:id/knowledge/:documentId/reindex')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async reindexDocument(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('documentId', ParseIntPipe) documentId: number,
+  ) {
+    const document = await this.documents.reindex(id, documentId);
+    if (!document) throw new NotFoundException('No such document.');
+    return { document };
+  }
+
+  @Post('applications/:id/knowledge/reindex')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async reindexAllDocuments(@Param('id', ParseIntPipe) id: number) {
+    return this.documents.reindexAll(id);
+  }
+
+  @Delete('applications/:id/knowledge/:documentId')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async deleteDocument(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('documentId', ParseIntPipe) documentId: number,
+  ) {
+    const removed = await this.documents.remove(id, documentId);
+    if (!removed) throw new NotFoundException('No such document.');
+    return { deleted: true };
   }
 
   // ── Functions ──────────────────────────────────────────────────────────────
@@ -563,6 +747,19 @@ export class AdminController {
    * base URL or model id is caught in the editor rather than by the first real
    * chat request.
    */
+  /**
+   * The instruction prefixes a model id implies.
+   *
+   * Exists so the console can show an operator what "leave it blank" will
+   * actually do, without keeping a second copy of the family table in browser
+   * JavaScript that would drift from the one the service uses.
+   */
+  @Get('models/prefix-defaults')
+  @UseGuards(AdminSessionGuard)
+  prefixDefaults(@Query('modelId') modelId?: string) {
+    return defaultPrefixesFor(modelId ?? '');
+  }
+
   @Post('models/test')
   @UseGuards(AdminSessionGuard)
   @RequireAdminRole('admin')

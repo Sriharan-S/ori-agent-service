@@ -44,6 +44,12 @@ export default tseslint.config(
     rules: {
       '@typescript-eslint/no-unsafe-argument': 'off',
       '@typescript-eslint/unbound-method': 'off',
+      // A test double for an async interface is written `async` because the
+      // thing it replaces is async — not because its body awaits anything.
+      // Enforcing this here only produces `() => Promise.resolve(x)` wrappers,
+      // which say less. It stays on for src, where "async but never awaits" is
+      // a real signal.
+      '@typescript-eslint/require-await': 'off',
     },
   },
 );

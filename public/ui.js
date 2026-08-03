@@ -60,6 +60,7 @@ const PATHS = {
   moon: 'M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z',
   logout: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9',
   plus: 'M12 5v14M5 12h14',
+  upload: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12',
   check: 'M20 6 9 17l-5-5',
   alert: 'M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z',
   clock: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20ZM12 6v6l4 2',
@@ -99,6 +100,13 @@ export const fmt = {
   ms: (v) => (v === null || v === undefined ? '—' : `${Number(v).toLocaleString()} ms`),
   pct: (v) => `${Math.round((v || 0) * 100)}%`,
   num: (v) => (v === null || v === undefined ? '—' : Number(v).toLocaleString()),
+  bytes: (v) => {
+    const size = Number(v);
+    if (!Number.isFinite(size) || size <= 0) return '—';
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
+    return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  },
   time: (v) => (v ? new Date(v).toLocaleString() : '—'),
   ago: (v) => {
     if (!v) return '—';

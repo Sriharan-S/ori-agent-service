@@ -12,8 +12,19 @@
  * shown as the literal text the model wrote, which is the honest failure mode.
  */
 
-/** `**bold**`, `*italic*`, `` `code` ``, and `[text](url)`, in one pass. */
-const INLINE = /(\*\*[^*]+\*\*|__[^_]+__|\*[^*\n]+\*|_[^_\n]+_|`[^`]+`|\[[^\]]+\]\([^)\s]+\))/g;
+/**
+ * `**bold**`, `*italic*`, `` `code` ``, and `[text](url)`, in one pass.
+ *
+ * The underscore forms require a non-word character on each outer edge, which
+ * is what CommonMark specifies and what keeps snake_case intact. Without it,
+ * any answer containing two underscored words joined them into one italic run:
+ * `find_user needs one of: email, user_id` rendered as "finduser needs one of:
+ * email, userid", silently deleting the underscores from values a user might
+ * need to copy. Asterisk emphasis has no such rule because `*` does not occur
+ * inside identifiers.
+ */
+const INLINE =
+  /(\*\*[^*]+\*\*|(?<![A-Za-z0-9])__[^_]+__(?![A-Za-z0-9])|\*[^*\n]+\*|(?<![A-Za-z0-9])_[^_\n]+_(?![A-Za-z0-9])|`[^`]+`|\[[^\]]+\]\([^)\s]+\))/g;
 
 /** Only these schemes become real links. Anything else stays as text. */
 function safeHref(url) {

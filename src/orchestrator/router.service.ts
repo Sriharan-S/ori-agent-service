@@ -3,7 +3,23 @@ import type { Candidate } from '../registry/function.contract';
 import type { PendingDisambiguation } from '../memory/conversation.service';
 import type { Intent, RouterDecision } from './orchestrator.types';
 
-const GREETING = /^(hi|hello|hey|yo|good (morning|afternoon|evening))\b/i;
+/**
+ * An opening pleasantry, and only the pleasantry.
+ *
+ * Stripped rather than matched, because people put one in front of real
+ * requests: "hi can you fetch the report for Priya" is a request wearing a
+ * greeting. This was anchored only at the start, so *any* message beginning
+ * with "hi" was classified as small talk — the request never reached the agent
+ * at all, and the conversational path cheerfully described what it would have
+ * done. `THANKS` below was always anchored at both ends, which is why it never
+ * had the same problem.
+ */
+const GREETING_PREFIX =
+  /^\s*(hi+|hey+|hello|yo|hiya|greetings|good\s+(morning|afternoon|evening|day))(\s+there)?\b[\s,!.:-]*/i;
+
+/** Filler that adds nothing to a request. "hi, please can you…" */
+const POLITE_PREFIX = /^\s*(please|kindly|could you|can you please)\b[\s,]*/i;
+
 const THANKS = /^(thanks|thank you|ta|cheers|great|nice|perfect|ok(ay)?)\b[\s!.]*$/i;
 
 /**
@@ -36,6 +52,22 @@ const CAPABILITY = new RegExp(
   ].join('|'),
   'i',
 );
+
+/**
+ * Remove the opening pleasantries, repeatedly.
+ *
+ * "hi, please can you…" carries two, and one pass would leave the second. The
+ * loop is bounded by the string only ever getting shorter.
+ */
+function stripPleasantries(text: string): string {
+  let remaining = text.trim();
+
+  for (;;) {
+    const next = remaining.replace(GREETING_PREFIX, '').replace(POLITE_PREFIX, '');
+    if (next === remaining) return remaining.trim();
+    remaining = next;
+  }
+}
 
 const WRITE_VERB =
   /\b(update|change|rename|set|edit|modify|correct|fix|delete|remove|deactivate|disable|enable|reset|assign|approve|reject)\b/i;
@@ -87,12 +119,15 @@ export class RouterService {
   }
 
   private classifyFresh(text: string): Intent {
-    if (GREETING.test(text) || THANKS.test(text) || CAPABILITY.test(text)) {
-      return 'conversational';
-    }
-    if (WRITE_VERB.test(text)) {
-      return 'write';
-    }
+    // A greeting in front of a request is decoration. Take it off and classify
+    // what is actually being asked; a message that was *only* a greeting has
+    // nothing left, and that is what makes it small talk.
+    const asked = stripPleasantries(text);
+
+    if (asked === '') return 'conversational';
+    if (THANKS.test(asked) || CAPABILITY.test(asked)) return 'conversational';
+    if (WRITE_VERB.test(asked)) return 'write';
+
     return 'read';
   }
 
@@ -132,6 +167,11 @@ export class RouterService {
     if (contains.length === 1) return contains[0]!;
 
     return null;
+  }
+
+  /** Exposed for the tests, which pin the greeting-prefix case specifically. */
+  stripPleasantries(text: string): string {
+    return stripPleasantries(text);
   }
 
   private parseOrdinal(text: string): number | null {

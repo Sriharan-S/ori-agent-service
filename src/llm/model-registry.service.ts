@@ -8,7 +8,22 @@ import { decryptSecret, encryptSecret } from '../common/crypto';
 import { PrimaryDb, quoteIdent } from '../db/primary.db';
 import { OpenAiCompatibleProvider } from './openai-compatible.provider';
 
-export type ModelPurpose = 'any' | 'planner' | 'synthesizer' | 'router';
+export type ModelPurpose =
+  | 'any'
+  | 'planner'
+  | 'synthesizer'
+  | 'router'
+  /**
+   * Turns text into a vector. Not a chat model and never interchangeable with
+   * one — which is why it is excluded from the `any` fallback below.
+   *
+   * It is its own purpose because the provider running the chat models often
+   * cannot do this at all: Groq, for one, hosts no embedding model, so a
+   * deployment that plans on Groq has to point the embedding half of knowledge
+   * search somewhere else entirely. Leaving it unconfigured is supported —
+   * retrieval falls back to lexical search.
+   */
+  | 'embedding';
 
 export interface ModelRecord {
   id: number;
@@ -26,11 +41,22 @@ export interface ModelRecord {
   temperature: number;
   lastOkAt: Date | null;
   lastError: string | null;
+  /**
+   * Instruction prefixes for an asymmetric embedding model. `null` means "use
+   * the default for this model family"; `''` means "deliberately none". Safe to
+   * expose — they are model documentation, not credentials.
+   */
+  embeddingQueryPrefix: string | null;
+  embeddingPassagePrefix: string | null;
+  /** Header names only. The values are secrets and never leave the LLM layer. */
+  extraHeaderNames: string[];
 }
 
 /** Includes the decrypted credential. Never leaves the LLM layer. */
 export interface ResolvedModel extends ModelRecord {
   apiKey: string;
+  /** Sent alongside the built-in headers. Values may be gateway credentials. */
+  extraHeaders: Record<string, string>;
 }
 
 export interface ModelInput {
@@ -46,6 +72,10 @@ export interface ModelInput {
   timeoutMs?: number | null;
   maxOutputTokens?: number | null;
   temperature?: number | null;
+  embeddingQueryPrefix?: string | null;
+  embeddingPassagePrefix?: string | null;
+  /** Undefined leaves the stored headers alone; null or {} clears them. */
+  extraHeaders?: Record<string, string> | null;
 }
 
 interface ModelRow {
@@ -65,6 +95,9 @@ interface ModelRow {
   temperature: string | null;
   last_ok_at: Date | null;
   last_error: string | null;
+  embedding_query_prefix: string | null;
+  embedding_passage_prefix: string | null;
+  extra_headers_encrypted: string | null;
 }
 
 /**
@@ -122,7 +155,14 @@ export class ModelRegistryService implements OnModuleInit {
         (model) =>
           model.applicationId === null || model.applicationId === applicationId,
       )
-      .filter((model) => model.purpose === purpose || model.purpose === 'any')
+      // `any` means "any chat purpose". An embedding endpoint answers a
+      // different API shape, so a general chat model is never a candidate for
+      // it and an embedding model is never a candidate for anything else.
+      .filter((model) =>
+        purpose === 'embedding'
+          ? model.purpose === 'embedding'
+          : model.purpose === purpose || model.purpose === 'any',
+      )
       .sort((a, b) => {
         if (a.purpose !== b.purpose) return a.purpose === purpose ? -1 : 1;
         // Application-specific configuration beats the global default.
@@ -139,7 +179,9 @@ export class ModelRegistryService implements OnModuleInit {
     const rows = await this.db.query<ModelRow>(
       `SELECT id, application_id, name, provider, base_url, model_id,
               api_key_encrypted, purpose, priority, is_enabled, supports_streaming,
-              timeout_ms, max_output_tokens, temperature, last_ok_at, last_error
+              timeout_ms, max_output_tokens, temperature, last_ok_at, last_error,
+              embedding_query_prefix, embedding_passage_prefix,
+              extra_headers_encrypted
          FROM ${this.schema}.agent_models
         ORDER BY priority, id`,
     );
@@ -152,7 +194,9 @@ export class ModelRegistryService implements OnModuleInit {
   /** Management view — no credentials. */
   async list(): Promise<ModelRecord[]> {
     const models = await this.all();
-    return models.map(({ apiKey: _apiKey, ...record }) => record);
+    return models.map(
+      ({ apiKey: _apiKey, extraHeaders: _extraHeaders, ...record }) => record,
+    );
   }
 
   async upsert(input: ModelInput, id?: number): Promise<ModelRecord> {
@@ -163,6 +207,21 @@ export class ModelRegistryService implements OnModuleInit {
           ? null
           : encryptSecret(input.apiKey, this.key);
 
+    // Headers follow the same three-state rule as the key: undefined leaves
+    // what is stored, null or an empty object clears it, anything else replaces
+    // it. Encrypted because a gateway header is a credential — `cf-aig-
+    // authorization` is a bearer token by another name.
+    const headers =
+      input.extraHeaders === undefined
+        ? undefined
+        : input.extraHeaders === null ||
+            Object.keys(input.extraHeaders).length === 0
+          ? null
+          : encryptSecret(
+              JSON.stringify(assertHeaders(input.extraHeaders)),
+              this.key,
+            );
+
     const row = id
       ? await this.db.one<ModelRow>(
           `UPDATE ${this.schema}.agent_models
@@ -171,6 +230,10 @@ export class ModelRegistryService implements OnModuleInit {
                   supports_streaming = $9, timeout_ms = $10,
                   max_output_tokens = $11, temperature = $12,
                   api_key_encrypted = COALESCE($13, api_key_encrypted),
+                  embedding_query_prefix = $14,
+                  embedding_passage_prefix = $15,
+                  extra_headers_encrypted =
+                    CASE WHEN $16 THEN $17 ELSE extra_headers_encrypted END,
                   updated_at = now()
             WHERE id = $1
         RETURNING *`,
@@ -188,14 +251,21 @@ export class ModelRegistryService implements OnModuleInit {
             input.maxOutputTokens ?? null,
             input.temperature ?? null,
             encrypted ?? null,
+            input.embeddingQueryPrefix ?? null,
+            input.embeddingPassagePrefix ?? null,
+            // COALESCE cannot express "clear it", and clearing a stale gateway
+            // header has to be possible. A flag plus a value can say all three.
+            input.extraHeaders !== undefined,
+            headers ?? null,
           ],
         )
       : await this.db.one<ModelRow>(
           `INSERT INTO ${this.schema}.agent_models
              (application_id, name, base_url, model_id, purpose, priority,
               is_enabled, supports_streaming, timeout_ms, max_output_tokens,
-              temperature, api_key_encrypted)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+              temperature, api_key_encrypted, embedding_query_prefix,
+              embedding_passage_prefix, extra_headers_encrypted)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         RETURNING *`,
           [
             input.applicationId,
@@ -210,11 +280,18 @@ export class ModelRegistryService implements OnModuleInit {
             input.maxOutputTokens ?? null,
             input.temperature ?? null,
             encrypted ?? null,
+            input.embeddingQueryPrefix ?? null,
+            input.embeddingPassagePrefix ?? null,
+            headers ?? null,
           ],
         );
 
     this.cache = null;
-    const { apiKey: _apiKey, ...record } = this.toResolved(row!);
+    const {
+      apiKey: _apiKey,
+      extraHeaders: _extraHeaders,
+      ...record
+    } = this.toResolved(row!);
     return record;
   }
 
@@ -252,6 +329,7 @@ export class ModelRegistryService implements OnModuleInit {
     modelId: string;
     apiKey?: string | null;
     existingId?: number | null;
+    extraHeaders?: Record<string, string> | null;
   }): Promise<{
     ok: boolean;
     latencyMs: number;
@@ -259,12 +337,17 @@ export class ModelRegistryService implements OnModuleInit {
     error?: string;
   }> {
     let apiKey = input.apiKey ?? '';
+    // Headers behave like the key: left out of the test means "use the saved
+    // ones", so testing an existing model does not require re-typing a gateway
+    // token that the form deliberately never showed back.
+    let extraHeaders = input.extraHeaders ?? {};
 
-    if (!apiKey && input.existingId) {
+    if (input.existingId && (!apiKey || !input.extraHeaders)) {
       const stored = (await this.all()).find(
         (model) => model.id === input.existingId,
       );
-      apiKey = stored?.apiKey ?? '';
+      if (!apiKey) apiKey = stored?.apiKey ?? '';
+      if (!input.extraHeaders) extraHeaders = stored?.extraHeaders ?? {};
     }
 
     const probe: ResolvedModel = {
@@ -284,6 +367,10 @@ export class ModelRegistryService implements OnModuleInit {
       temperature: 0,
       lastOkAt: null,
       lastError: null,
+      embeddingQueryPrefix: null,
+      embeddingPassagePrefix: null,
+      extraHeaders,
+      extraHeaderNames: Object.keys(extraHeaders),
     };
 
     const startedAt = Date.now();
@@ -357,6 +444,26 @@ export class ModelRegistryService implements OnModuleInit {
       }
     }
 
+    // Same treatment as the key, and the same reason: unreadable headers mean
+    // the request goes out without them, which is a visible 401 from the
+    // gateway rather than a silent wrong answer.
+    let extraHeaders: Record<string, string> = {};
+    if (row.extra_headers_encrypted) {
+      try {
+        const parsed: unknown = JSON.parse(
+          decryptSecret(row.extra_headers_encrypted, this.key),
+        );
+        if (typeof parsed === 'object' && parsed !== null) {
+          extraHeaders = parsed as Record<string, string>;
+        }
+      } catch {
+        this.logger.error(
+          `Model "${row.name}" has request headers that cannot be read with the ` +
+            'current ENCRYPTION_KEY. Re-enter them in the dashboard.',
+        );
+      }
+    }
+
     return {
       id: Number(row.id),
       applicationId: row.application_id ? Number(row.application_id) : null,
@@ -378,8 +485,45 @@ export class ModelRegistryService implements OnModuleInit {
           : Number(row.temperature),
       lastOkAt: row.last_ok_at,
       lastError: row.last_error,
+      embeddingQueryPrefix: row.embedding_query_prefix,
+      embeddingPassagePrefix: row.embedding_passage_prefix,
+      extraHeaders,
+      extraHeaderNames: Object.keys(extraHeaders),
     };
   }
+}
+
+/**
+ * Reject header names and values that are not headers.
+ *
+ * The console validates too, but it is not the only client — the management API
+ * takes the same input. Two things are being stopped here. A value carrying CR
+ * or LF is header injection in its classic form, and while `fetch` would refuse
+ * it anyway, failing at save time names the problem instead of producing a model
+ * that throws on every request. And a non-string value would be stored, then
+ * later sent as `[object Object]`, which is a header the gateway rejects for
+ * reasons nobody would guess from the message.
+ *
+ * Throws rather than sanitising: an operator who typed a newline into a header
+ * meant something, and quietly removing it would send a credential they did not
+ * write.
+ */
+function assertHeaders(headers: Record<string, string>): Record<string, string> {
+  for (const [name, value] of Object.entries(headers)) {
+    // RFC 7230 token. Anything outside it cannot be a header name.
+    if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name)) {
+      throw new Error(
+        `"${name}" is not a valid HTTP header name. Use letters, digits and dashes.`,
+      );
+    }
+    if (typeof value !== 'string') {
+      throw new Error(`Header "${name}" must have a string value.`);
+    }
+    if (/[\r\n]/.test(value)) {
+      throw new Error(`Header "${name}" must not contain a line break.`);
+    }
+  }
+  return headers;
 }
 
 /**

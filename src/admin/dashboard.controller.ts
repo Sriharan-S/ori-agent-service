@@ -27,6 +27,7 @@ const ASSETS: Record<string, { file: string; type: string }> = {
   guide: { file: 'guide.js', type: 'text/javascript; charset=utf-8' },
   playground: { file: 'playground.js', type: 'text/javascript; charset=utf-8' },
   markdown: { file: 'markdown.js', type: 'text/javascript; charset=utf-8' },
+  knowledge: { file: 'knowledge.js', type: 'text/javascript; charset=utf-8' },
 };
 
 /**
@@ -97,6 +98,11 @@ export class DashboardController {
   @Get('admin/markdown.js')
   markdown(@Res() response: Response): void {
     this.send('markdown', response);
+  }
+
+  @Get('admin/knowledge.js')
+  knowledge(@Res() response: Response): void {
+    this.send('knowledge', response);
   }
 
   private send(key: string, response: Response): void {

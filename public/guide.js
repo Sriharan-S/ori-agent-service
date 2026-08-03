@@ -29,6 +29,7 @@ const SECTIONS = [
       { id: 'roles', title: 'Roles and scopes' },
       { id: 'functions', title: 'Functions' },
       { id: 'ambiguity', title: 'Asking instead of guessing' },
+      { id: 'knowledge', title: 'The knowledge base' },
     ],
   },
   {
@@ -328,6 +329,42 @@ const ARTICLES = {
       ' genuinely distinguishing. "Order ORD-1002" and "Order ORD-1002" as two candidates ',
       'is a question nobody can answer; "ORD-1002 · shipped 12 Jul" and ',
       '"ORD-21002 · pending" is one they can.'),
+  ),
+
+  knowledge: () => frag(
+    h3('knowledge', 'The knowledge base'),
+    p('Functions tell the agent what it can look up. They say nothing about what any of ',
+      'it means — what a level is, when credits are consumed, what a band on a score ',
+      'signifies. Documents fill that in.'),
+    p('Upload them under Knowledge: PDF, Word, text, Markdown, CSV, or pasted straight ',
+      'in. Each one declares which roles may retrieve it, and that filter is applied in ',
+      'the query — a document a role may not see cannot influence what that role gets ',
+      'back, and cannot take up one of the few slots a prompt has room for.'),
+    p('They are used in four places:'),
+    ul(
+      'Choosing a function, so the user\'s words map onto the right one. Background only — every fact still comes from a function call.',
+      'Writing an answer, so a returned number can be explained. A live result always beats a document.',
+      'When no function fits: the agent answers from the documents instead, citing them with [1] markers.',
+      '"What can you do", so the answer describes the product rather than reciting a list of functions.'),
+    p('The first is the one to be careful with. A model handed documentation while it is ',
+      'choosing a function will otherwise answer from the documentation, and report a ',
+      'balance it read in a worked example. It is told explicitly that these are ',
+      'documents and not data.'),
+
+    h4('How a passage is found'),
+    p('Two searches run and their rankings are combined. Keyword search is exact and ',
+      'cannot match "how much does it cost" against a section headed "Pricing"; meaning ',
+      'search does that, and will confidently return something adjacent when the user ',
+      'typed a reference code. Each covers the other\'s blind spot.'),
+    p('The meaning half needs an embedding model, and is optional:'),
+    ul(
+      'None configured — keyword search only. Works immediately, weaker on rephrasing. The Knowledge page says so rather than leaving you to guess.',
+      'One configured — both halves run. Add it on Models with purpose "embedding", then Re-index all.',
+      'It is a separate model row because the provider running your chat model often cannot embed at all, so it can point anywhere.'),
+    p('Adding an embedding model later does not mean uploading everything again — the ',
+      'extracted text is kept, and Re-index all rebuilds from it.'),
+    p('A scanned PDF has no text to extract, and the upload says so rather than storing ',
+      'an empty document. Run it through OCR, or paste the text in instead.'),
   ),
 
   // ── How to ────────────────────────────────────────────────────────────────

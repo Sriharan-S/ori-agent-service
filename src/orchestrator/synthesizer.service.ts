@@ -3,10 +3,16 @@ import { LlmService } from '../llm/llm.service';
 import type { ChatMessage } from '../llm/llm.types';
 import type { Candidate } from '../registry/function.contract';
 import type { ConversationTurn } from '../memory/conversation.service';
+import {
+  formatReference,
+  formatSources,
+} from '../knowledge/knowledge-prompt';
+import type { Passage } from '../knowledge/retrieval.service';
 import type { AgentEventSink, CallOutcome } from './orchestrator.types';
 import { presentRecord, presentRecords } from './evidence';
 import {
   ORI_CONVERSATIONAL_PERSONA,
+  ORI_KNOWLEDGE_PERSONA,
   ORI_STATIC_FALLBACKS,
   ORI_SYNTHESIZER_PERSONA,
 } from './ori-persona';
@@ -34,6 +40,8 @@ export class SynthesizerService {
     history: ConversationTurn[],
     applicationId: number,
     emit: AgentEventSink,
+    /** Documentation that explains the results. Never a source of facts. */
+    passages: Passage[] = [],
   ): Promise<string> {
     const denials = outcomes.filter(
       (outcome) => outcome.result.status === 'denied',
@@ -61,7 +69,8 @@ export class SynthesizerService {
 ${question}
 ${formatHistory(history)}
 ═══ NOTES: THE ONLY FACTS YOU MAY USE ═══
-${buildEvidence(outcomes)}`,
+${buildEvidence(outcomes)}
+${formatReference(passages)}`,
       },
       {
         role: 'user',
@@ -144,6 +153,61 @@ ${buildEvidence(outcomes)}`,
     ].join('\n');
   }
 
+  /**
+   * An answer built entirely from uploaded documentation.
+   *
+   * Reached when the question is a real one, no function serves it, and the
+   * knowledge base covers it — "what does the Agile band mean", "how long do
+   * credits last". This is the only path that answers without touching live
+   * data, which is why it is the only one that cites: the reader has to be able
+   * to tell documentation from records.
+   */
+  async fromKnowledge(
+    question: string,
+    passages: Passage[],
+    history: ConversationTurn[],
+    applicationId: number,
+    emit: AgentEventSink,
+  ): Promise<string> {
+    const messages: ChatMessage[] = [
+      {
+        role: 'system',
+        content: `${ORI_KNOWLEDGE_PERSONA}
+${formatHistory(history)}
+═══ WHAT THE DOCUMENTATION SAYS ═══
+${formatSources(passages)}`,
+      },
+      { role: 'user', content: question },
+    ];
+
+    try {
+      let text = '';
+      const stream = this.llm.stream(messages, {
+        purpose: 'synthesizer',
+        applicationId,
+        temperature: 0.2,
+        maxTokens: 600,
+      });
+
+      for (;;) {
+        const next = await stream.next();
+        if (next.done) break;
+        text += next.value;
+        emit({ type: 'message.delta', channel: 'user', text: next.value });
+      }
+
+      return text.trim();
+    } catch (error) {
+      this.logger.error(`Knowledge answer failed: ${describeError(error)}`);
+      emit({
+        type: 'message.delta',
+        channel: 'user',
+        text: ORI_STATIC_FALLBACKS.llmUnavailable,
+      });
+      return ORI_STATIC_FALLBACKS.llmUnavailable;
+    }
+  }
+
   /** Small talk and "what can you do". No data, so no evidence block. */
   async conversational(
     question: string,
@@ -151,6 +215,8 @@ ${buildEvidence(outcomes)}`,
     history: ConversationTurn[],
     applicationId: number,
     emit: AgentEventSink,
+    /** Product documentation, so "what can you do" is not just a function list. */
+    passages: Passage[] = [],
   ): Promise<string> {
     const messages: ChatMessage[] = [
       {
@@ -159,6 +225,7 @@ ${buildEvidence(outcomes)}`,
 
 ═══ WHAT YOU CAN ACTUALLY DO (describe only these) ═══
 ${capabilities.map((line) => `- ${line}`).join('\n') || '- Nothing is configured yet.'}
+${formatReference(passages)}
 ${formatHistory(history)}`,
       },
       { role: 'user', content: question },
@@ -253,7 +320,18 @@ function buildEvidence(outcomes: CallOutcome[]): string {
         case 'denied':
           return `Access denied — ${result.reason}`;
         case 'error':
-          return `This step failed — ${result.message}`;
+          // Spelled out because the model will otherwise soften it into a
+          // waiting state. Asked to generate a report against a service that
+          // was down, it answered "the report is not ready yet" — which reads
+          // as *in progress*, so the user waits for something that will never
+          // arrive and does not know to retry. A failure has to sound like one.
+          return (
+            `This step FAILED and produced nothing: ${result.message}\n` +
+            'Nothing was created, changed or retrieved by it. Tell the user ' +
+            'plainly that it could not be done. Do NOT describe it as pending, ' +
+            'in progress, being prepared, on its way, or "not ready yet" — none ' +
+            'of those are true, and none of them will become true by waiting.'
+          );
         case 'ambiguous':
           // Unreachable: the reflector short-circuits before synthesis.
           return `Several records matched ${result.searchedBy}.`;
@@ -295,6 +373,10 @@ function renderWithoutLlm(outcomes: CallOutcome[]): string {
   return parts.length > 0
     ? parts.join('\n')
     : ORI_STATIC_FALLBACKS.llmUnavailable;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function formatHistory(history: ConversationTurn[]): string {

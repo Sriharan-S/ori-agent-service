@@ -51,6 +51,16 @@ export interface CallOutcome {
    * appended to the answer verbatim instead of being described.
    */
   artifacts?: ResultArtifact[];
+  /**
+   * Why this call failed, in the vocabulary of whoever wrote the function.
+   *
+   * `result.message` is what a user may be shown and is deliberately vague;
+   * this is the specific one — "needs at least one of: email, userid" — and it
+   * exists because the agent loop can only correct a mistake it is told the
+   * shape of. It reaches the model and the trace channel. It must never reach
+   * the user: it names parameters, functions and internal constraints.
+   */
+  operatorDetail?: string;
 }
 
 export type AgentResponseType =
@@ -142,6 +152,22 @@ export type AgentEvent =
       /** True when no model chose this — the planner was unavailable. */
       isFallback: boolean;
       calls: Array<{ name: string; params: Record<string, unknown>; reason: string }>;
+    }
+  /**
+   * One turn of the agent loop, before the tool runs.
+   *
+   * The loop is iterative, so "what did it decide" is no longer a single event
+   * — this is emitted per step, and `step` is what makes a lookup-then-act run
+   * legible as two decisions rather than one confused one.
+   */
+  | {
+      type: 'agent.step';
+      channel: 'trace';
+      step: number;
+      /** Empty when the model stopped calling tools and wrote prose instead. */
+      calls: Array<{ name: string; params: Record<string, unknown> }>;
+      /** Prose the model produced alongside (or instead of) a call. */
+      text: string;
     }
   | { type: 'function.started'; channel: 'trace'; name: string }
   | {

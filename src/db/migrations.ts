@@ -48,6 +48,8 @@ export const AGENT_TABLES = [
   'agent_messages',
   'agent_runs',
   'agent_audit_log',
+  'agent_documents',
+  'agent_document_chunks',
 ] as const;
 
 export function buildMigrations(schema: string): Migration[] {
@@ -434,6 +436,154 @@ export function buildMigrations(schema: string): Migration[] {
       sql: `
         ALTER TABLE ${s}.agent_services
           ADD COLUMN IF NOT EXISTS public_base_url TEXT;
+      `,
+    },
+
+    {
+      // The knowledge base: what an operator uploads so the agent knows what
+      // the application *is*, not just what it can query.
+      //
+      // A document is stored whole and also split into chunks, and both are
+      // kept. The whole text is what an operator re-reads and re-indexes from,
+      // so a change to the chunking strategy does not mean re-uploading every
+      // file; the chunks are what retrieval actually searches.
+      id: '0009_knowledge',
+      sql: `
+        CREATE TABLE IF NOT EXISTS ${s}.agent_documents (
+          id             BIGSERIAL PRIMARY KEY,
+          application_id BIGINT      NOT NULL REFERENCES ${s}.agent_applications(id) ON DELETE CASCADE,
+          title          TEXT        NOT NULL,
+          -- 'file': uploaded and extracted. 'text': pasted straight in.
+          source_type    TEXT        NOT NULL DEFAULT 'text',
+          filename       TEXT,
+          mime_type      TEXT,
+          byte_size      BIGINT      NOT NULL DEFAULT 0,
+          -- SHA-256 of the extracted text. Re-uploading an unchanged file is a
+          -- no-op rather than a second copy competing with the first in search.
+          checksum       TEXT,
+          -- Roles that may retrieve this, or ARRAY['*']. Same shape and same
+          -- meaning as agent_functions.allowed_roles, deliberately: an operator
+          -- who has understood one has understood the other.
+          allowed_roles  TEXT[]      NOT NULL DEFAULT ARRAY['*']::TEXT[],
+          content        TEXT        NOT NULL DEFAULT '',
+          status         TEXT        NOT NULL DEFAULT 'pending',
+          error          TEXT,
+          chunk_count    INTEGER     NOT NULL DEFAULT 0,
+          embedded_count INTEGER     NOT NULL DEFAULT 0,
+          created_by     BIGINT,
+          created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+          CONSTRAINT agent_documents_status_check
+            CHECK (status IN ('pending', 'ready', 'failed')),
+          CONSTRAINT agent_documents_source_check
+            CHECK (source_type IN ('file', 'text'))
+        );
+
+        CREATE INDEX IF NOT EXISTS agent_documents_app_idx
+          ON ${s}.agent_documents (application_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS ${s}.agent_document_chunks (
+          id              BIGSERIAL PRIMARY KEY,
+          document_id     BIGINT      NOT NULL REFERENCES ${s}.agent_documents(id) ON DELETE CASCADE,
+          application_id  BIGINT      NOT NULL REFERENCES ${s}.agent_applications(id) ON DELETE CASCADE,
+          ordinal         INTEGER     NOT NULL,
+          heading         TEXT,
+          content         TEXT        NOT NULL,
+          -- Denormalised from the parent so the retrieval query filters by role
+          -- without a join. Rewritten whenever the document's roles change.
+          allowed_roles   TEXT[]      NOT NULL DEFAULT ARRAY['*']::TEXT[],
+          -- Plain float array, so the knowledge base works on a stock Postgres
+          -- with no extension. pgvector, when present, adds a second column
+          -- below and takes over the distance computation.
+          embedding       REAL[],
+          embedding_model TEXT,
+          -- Lexical half of hybrid retrieval. Generated rather than maintained,
+          -- so it cannot drift from the content it indexes. The two-argument
+          -- to_tsvector is immutable, which is what makes it legal here.
+          search_tsv      tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+          created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+          UNIQUE (document_id, ordinal)
+        );
+
+        CREATE INDEX IF NOT EXISTS agent_document_chunks_fts_idx
+          ON ${s}.agent_document_chunks USING GIN (search_tsv);
+
+        CREATE INDEX IF NOT EXISTS agent_document_chunks_app_idx
+          ON ${s}.agent_document_chunks (application_id);
+      `,
+    },
+
+    {
+      // Embedding endpoints are models too, but not chat models — see
+      // ModelPurpose. The constraint has to admit the new value before one can
+      // be saved.
+      id: '0010_model_embedding_purpose',
+      sql: `
+        ALTER TABLE ${s}.agent_models
+          DROP CONSTRAINT IF EXISTS agent_models_purpose_check;
+
+        ALTER TABLE ${s}.agent_models
+          ADD CONSTRAINT agent_models_purpose_check
+          CHECK (purpose IN ('any', 'planner', 'synthesizer', 'router', 'embedding'));
+      `,
+    },
+
+    {
+      /**
+       * pgvector, if this database happens to have it.
+       *
+       * Conditional because the target Postgres belongs to the host
+       * application, not to this service — it may be managed, and asking an
+       * operator to get an extension installed before they can upload a text
+       * file would be a poor trade. Without pgvector the same vectors live in
+       * the REAL[] column above and are compared in process, which is fine into
+       * the low thousands of chunks. With it, the distance computation happens
+       * in the database and stays fast well past that.
+       *
+       * The column is declared without a dimension on purpose: the dimension is
+       * a property of whichever embedding model the operator configures, and is
+       * not known when this runs. That rules out an HNSW index, which needs a
+       * fixed width — so this buys fast in-database distance, not an index.
+       */
+      id: '0011_knowledge_pgvector',
+      sql: `
+        DO $vector$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
+            EXECUTE 'ALTER TABLE ${s}.agent_document_chunks
+                       ADD COLUMN IF NOT EXISTS embedding_vec vector';
+            RAISE NOTICE 'pgvector detected — knowledge search will use it.';
+          ELSE
+            RAISE NOTICE 'No pgvector — knowledge search will compare vectors in the service.';
+          END IF;
+        END
+        $vector$;
+      `,
+    },
+
+    {
+      /**
+       * Two things a model row could not previously say.
+       *
+       * **Prefixes.** Most retrieval embedders are asymmetric and expect the
+       * query and the passage to be marked differently. Getting this wrong is
+       * silent — no error, just worse recall — so the strings are stored per
+       * model rather than assumed. NULL means "use the default for this model
+       * family"; an empty string means "deliberately none", which an operator
+       * needs to be able to say when a provider already applies it server-side.
+       *
+       * **Headers.** A gateway in front of a provider often needs one of its
+       * own — Cloudflare's authenticated AI Gateway wants `cf-aig-authorization`
+       * alongside the provider's `Authorization`. Encrypted, because that is
+       * exactly the kind of header these are, and never returned by the API for
+       * the same reason `api_key_encrypted` is not.
+       */
+      id: '0012_model_prefixes_and_headers',
+      sql: `
+        ALTER TABLE ${s}.agent_models
+          ADD COLUMN IF NOT EXISTS embedding_query_prefix   TEXT,
+          ADD COLUMN IF NOT EXISTS embedding_passage_prefix TEXT,
+          ADD COLUMN IF NOT EXISTS extra_headers_encrypted  TEXT;
       `,
     },
   ];

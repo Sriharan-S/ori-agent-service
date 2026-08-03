@@ -25,6 +25,68 @@ describe('RouterService', () => {
     });
 
     /**
+     * A greeting in front of a request is decoration, not the request.
+     *
+     * The greeting pattern was anchored only at the start, so *any* message
+     * beginning with "hi" became small talk. "hi can you fetch the report of
+     * Sriharan S2" never reached the agent at all — the conversational path
+     * answered it by describing what it would have done, and then, when the
+     * user said "ok", claimed to be processing something. Nothing was.
+     */
+    it.each([
+      ['hi can you fetch the report of sriharan s2', 'read'],
+      ['HI can you fetch the report of sriharan s2', 'read'],
+      ['hii, how many candidates are completed', 'read'],
+      ['hey whats the credit balance', 'read'],
+      ['hello, find the user with email x@y.com', 'read'],
+      ['good morning, list the candidates', 'read'],
+      ['hi please can you update the status', 'write'],
+      ['yo delete that record', 'write'],
+    ])('routes "%s" as %s, not small talk', (message, intent) => {
+      expect(router.classify(message, null).intent).toBe(intent);
+    });
+
+    it.each([
+      'hi',
+      'Hi!',
+      'hello',
+      'hey there',
+      'hiya',
+      'good morning',
+      'good evening!',
+    ])('still routes the bare greeting "%s" as conversational', (message) => {
+      expect(router.classify(message, null).intent).toBe('conversational');
+    });
+
+    it('still catches a capability question behind a greeting', () => {
+      expect(router.classify('hi, what can you do?', null).intent).toBe(
+        'conversational',
+      );
+      expect(router.classify('hello — help me', null).intent).toBe(
+        'conversational',
+      );
+    });
+
+    it('strips stacked pleasantries', () => {
+      // "hi, please …" carries two; one pass would leave the second. "can you"
+      // survives, and that is fine — it is part of the request and changes no
+      // classification.
+      expect(router.stripPleasantries('hi, please can you find Priya')).toBe(
+        'can you find Priya',
+      );
+      expect(router.stripPleasantries('  Hello!  ')).toBe('');
+      expect(router.stripPleasantries('hey there!')).toBe('');
+    });
+
+    it('does not strip a greeting from the middle of a request', () => {
+      // "hi" inside a name or a sentence is not a greeting.
+      expect(router.classify('find the candidate named Hiral', null).intent).toBe(
+        'read',
+      );
+      expect(router.stripPleasantries('find Hiral')).toBe('find Hiral');
+    });
+
+    /**
      * These all failed once, and the failure was not obvious: they went to the
      * read path, where the planner is obliged to pick a data function, so "show
      * me what you can do" was answered by reciting one student's registration

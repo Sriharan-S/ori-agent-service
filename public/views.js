@@ -470,13 +470,111 @@ function editModel(existing) {
   const baseUrl = textInput(existing?.baseUrl ?? '', { placeholder: 'http://host:8000/v1' });
   const modelId = textInput(existing?.modelId ?? '', { placeholder: 'Qwen/Qwen2.5-32B-Instruct-AWQ' });
   const apiKey = el('input', { type: 'password', placeholder: existing ? 'unchanged' : 'leave blank if none' });
-  const purpose = select(['any', 'planner', 'synthesizer', 'router'], existing?.purpose ?? 'any');
+  const purpose = select(
+    ['any', 'planner', 'synthesizer', 'router', 'embedding'],
+    existing?.purpose ?? 'any');
   const priority = el('input', { type: 'number', value: existing?.priority ?? 100 });
   const streaming = select(['yes', 'no'], existing?.supportsStreaming === false ? 'no' : 'yes');
   const enabled = select(['yes', 'no'], existing?.isEnabled === false ? 'no' : 'yes');
 
+  const headers = textArea('', 3);
+  headers.placeholder = '{"cf-aig-authorization": "Bearer …"}';
+
+  // Prefixes are only meaningful for an embedding model, and showing them
+  // against a chat model invites someone to fill them in.
+  const queryPrefix = textInput(existing?.embeddingQueryPrefix ?? '');
+  const passagePrefix = textInput(existing?.embeddingPassagePrefix ?? '');
+  const prefixHint = el('p', { class: 'field__hint' });
+  const embeddingFields = el('div', { hidden: true },
+    el('div', { class: 'formgrid' },
+      field('Query prefix', queryPrefix,
+        'Prepended to the user\'s question before embedding.', { optional: true }),
+      field('Passage prefix', passagePrefix,
+        'Prepended to each stored passage.', { optional: true })),
+    prefixHint);
+
+  /**
+   * Show the defaults rather than silently applying them.
+   *
+   * Most retrieval embedders are asymmetric — they expect the question and the
+   * passage marked differently, and getting it wrong costs accuracy with no
+   * error to notice. Leaving both boxes blank uses the right strings for the
+   * model family; this line says which, so "blank" does not read as "off".
+   *
+   * The strings come from the server rather than a copy kept here, because a
+   * second copy would drift and the failure would be invisible.
+   */
+  let defaults = { query: '', passage: '' };
+
+  const paintPrefixHint = () => {
+    const isEmbedding = purpose.value === 'embedding';
+    embeddingFields.hidden = !isEmbedding;
+    if (!isEmbedding) return;
+
+    const show = (v) => (v ? `"${v}"` : 'none');
+    prefixHint.textContent = queryPrefix.value || passagePrefix.value
+      ? 'Using what you typed. Clear both boxes to go back to the defaults for this model.'
+      : `Blank uses this model's defaults — query ${show(defaults.query)}, ` +
+        `passage ${show(defaults.passage)}. Type a single space to mean "no prefix at all".`;
+  };
+
+  const loadDefaults = async () => {
+    if (purpose.value !== 'embedding' || !modelId.value.trim()) {
+      paintPrefixHint();
+      return;
+    }
+    try {
+      defaults = await api(
+        `/models/prefix-defaults?modelId=${encodeURIComponent(modelId.value.trim())}`);
+    } catch {
+      // A hint that cannot be fetched is not worth an error. The server applies
+      // the same defaults either way.
+      defaults = { query: '', passage: '' };
+    }
+    paintPrefixHint();
+  };
+
+  // `change` rather than `input`, so this is one request when the field is left
+  // rather than one per keystroke.
+  purpose.addEventListener('change', () => void loadDefaults());
+  modelId.addEventListener('change', () => void loadDefaults());
+  queryPrefix.addEventListener('input', paintPrefixHint);
+  passagePrefix.addEventListener('input', paintPrefixHint);
+  void loadDefaults();
+
   const result = el('div');
   let tested = false;
+
+  // A space is how the form says "deliberately no prefix", because an empty box
+  // already means "use the default". It reaches the server as an empty string,
+  // which is the distinction the model row stores.
+  const prefixValue = (input) =>
+    input.value === '' ? null : input.value.trim() === '' ? '' : input.value;
+
+  /**
+   * The headers box, validated.
+   *
+   * `parseJson` hands back the raw text when it will not parse rather than the
+   * fallback, so "did this parse" cannot be answered by comparing to undefined.
+   * Getting that wrong would have meant a malformed header object was silently
+   * dropped and the model saved looking configured — surfacing later as an
+   * unexplained 401 from the gateway.
+   */
+  const readHeaders = () => {
+    const raw = headers.value.trim();
+    if (!raw) return { ok: true, value: undefined };
+
+    const parsed = parseJson(raw, undefined);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return { ok: false, message: 'Extra request headers must be a JSON object.' };
+    }
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value !== 'string') {
+        return { ok: false, message: `Header "${key}" must have a string value.` };
+      }
+    }
+    return { ok: true, value: parsed };
+  };
 
   const collect = () => ({
     applicationId: null,
@@ -488,6 +586,16 @@ function editModel(existing) {
     supportsStreaming: streaming.value === 'yes',
     isEnabled: enabled.value === 'yes',
     ...(apiKey.value ? { apiKey: apiKey.value } : {}),
+    ...(purpose.value === 'embedding'
+      ? {
+          embeddingQueryPrefix: prefixValue(queryPrefix),
+          embeddingPassagePrefix: prefixValue(passagePrefix),
+        }
+      : {}),
+    // Blank leaves stored headers alone; "{}" clears them.
+    ...(readHeaders().value !== undefined
+      ? { extraHeaders: readHeaders().value }
+      : {}),
   });
 
   openModal(existing ? `Edit ${existing.name}` : 'Add model', frag(
@@ -506,12 +614,30 @@ function editModel(existing) {
     el('div', { class: 'formgrid' },
       field('Purpose', purpose,
         'A purpose-specific model outranks <code>any</code>, so a small fast model can ' +
-        'route while something larger answers.'),
+        'route while something larger answers. <code>embedding</code> is the exception: ' +
+        'it answers <code>/embeddings</code> rather than <code>/chat/completions</code>, ' +
+        'so it is never used as a chat model and <code>any</code> is never used as an ' +
+        'embedding one. Add one to turn on meaning-based knowledge search, then ' +
+        're-index. <strong>Test connection does not work for it</strong> — it sends a ' +
+        'chat request.'),
       field('Priority', priority, 'Lower runs first. The next enabled model is its fallback.')),
 
     el('div', { class: 'formgrid' },
       field('Supports streaming', streaming, 'Set no if the endpoint has no SSE support.'),
       field('Enabled', enabled, 'Disabled models are skipped entirely.')),
+
+    embeddingFields,
+
+    field('Extra request headers', headers,
+      'JSON object, sent with every request to this endpoint. For a gateway that ' +
+      'needs its own header alongside the provider\'s — Cloudflare\'s authenticated ' +
+      'AI Gateway wants <code>cf-aig-authorization</code>. Encrypted at rest and ' +
+      'never shown again, like the API key. ' +
+      (existing?.extraHeaderNames?.length
+        ? `Currently set: <code>${existing.extraHeaderNames.join('</code>, <code>')}</code>. ` +
+          'Leave blank to keep them, or send <code>{}</code> to clear them.'
+        : 'Leave blank if you do not need any.'),
+      { optional: true }),
 
     result,
 
@@ -522,6 +648,20 @@ function editModel(existing) {
             result.replaceChildren(notice('Enter a base URL and a model id first.', 'bad'));
             return;
           }
+          if (purpose.value === 'embedding') {
+            result.replaceChildren(notice(
+              'Test connection sends a chat request, which an embeddings endpoint ' +
+              'will reject. Save the model and use Re-index on the Knowledge page ' +
+              'to check it instead.', 'warn'));
+            return;
+          }
+
+          const parsedHeaders = readHeaders();
+          if (!parsedHeaders.ok) {
+            result.replaceChildren(notice(parsedHeaders.message, 'bad'));
+            return;
+          }
+
           const outcome = await api('/models/test', {
             method: 'POST',
             body: {
@@ -529,6 +669,9 @@ function editModel(existing) {
               modelId: modelId.value.trim(),
               apiKey: apiKey.value || null,
               existingId: existing?.id ?? null,
+              ...(parsedHeaders.value !== undefined
+                ? { extraHeaders: parsedHeaders.value }
+                : {}),
             },
           });
           tested = outcome.ok;
@@ -554,7 +697,19 @@ function editModel(existing) {
       button('Save model', {
         variant: 'primary',
         onclick: async (event) => {
-          if (!tested && !confirm(
+          // Headers that will not parse must not be quietly dropped. Saving
+          // regardless produces a model that looks configured and sends none of
+          // them, which surfaces later as an unexplained 401 from the gateway.
+          const parsedHeaders = readHeaders();
+          if (!parsedHeaders.ok) {
+            toast(parsedHeaders.message, 'bad');
+            return;
+          }
+
+          // An embedding model is never tested, because the test sends a chat
+          // request. Nagging about it would train people to click through the
+          // warning that does matter.
+          if (!tested && purpose.value !== 'embedding' && !confirm(
             'This model has not been tested. Save it anyway?\n\n' +
             'An unreachable model is only noticed on the next real chat request.')) return;
 

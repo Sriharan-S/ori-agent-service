@@ -43,6 +43,19 @@ const ALLOWED_FRAGMENTS = new Set([
   // Fixed column list constant in observability.service.ts.
   'AUDIT_COLUMNS',
   /*
+   * Fixed column list constant in knowledge/document.service.ts.
+   *
+   * A module-level string literal naming the columns of `agent_documents`.
+   * Postgres cannot bind a column list as a parameter, and this one is not
+   * reachable from a request, an end user, an uploaded document or the LLM —
+   * it is the same category as SELECT_COLUMNS and AUDIT_COLUMNS above.
+   *
+   * Note what is *not* here: the retrieval pool sizes. They are module
+   * constants too, and binding them was still the right answer, because a LIMIT
+   * is a value and values get bound.
+   */
+  'SUMMARY_COLUMNS',
+  /*
    * Scope-sample lookup in database-info.service.ts.
    *
    * Postgres cannot bind an identifier as a parameter, so a query that reads

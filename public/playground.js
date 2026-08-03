@@ -207,6 +207,11 @@ export async function playgroundView() {
     session.turns.push(userTurn, bubbleRef);
     const showTrace = traceToggle.checked;
 
+    // One object for the whole run, not one per event. The agent loop reports
+    // its step number in its own event and the renderer has to remember it when
+    // the next one arrives — which a fresh literal per event cannot do.
+    const runContext = { bubbleRef, userTurn, showTrace, session, step: 1 };
+
     session.streaming = true;
     sendBtn.disabled = true;
     input.disabled = true;
@@ -227,7 +232,7 @@ export async function playgroundView() {
               role: roleSelect.value,
               scopes: collectScopes(scopeInputs),
             },
-        onEvent: (event) => handleEvent(event, { bubbleRef, userTurn, showTrace, session }),
+        onEvent: (event) => handleEvent(event, runContext),
       });
     } catch (error) {
       bubbleRef.failStages();
@@ -533,16 +538,45 @@ function handleEvent(event, ctx) {
     return;
   }
 
+  // The step number, tracked so the catalogue panel below is drawn once rather
+  // than repeated for every turn of the loop.
+  if (name === 'agent.step') {
+    ctx.step = data.step;
+    return;
+  }
+
   // ── Trace: how the functions were chosen ──────────────────────────────────
   //
   // Rendered as structure rather than a log line, because the question it has to
   // answer is "did the model pick this, or was it the only option".
+  //
+  // The agent works in steps now, so this arrives more than once per run. The
+  // catalogue is the same every time and only the decision changes, so step two
+  // onwards gets a one-line form — the alternative is the same wall of function
+  // chips three times over, which buries the thing that actually differs.
   if (name === 'plan.created') {
     if (data.reasoning) ctx.bubbleRef.think(data.reasoning);
 
     ctx.bubbleRef.traceList.hidden = false;
     const chosen = (data.calls ?? []).map((c) => c.name);
     const considered = data.considered ?? [];
+
+    if ((ctx.step ?? 1) > 1) {
+      mount(ctx.bubbleRef.traceList,
+        el('div', { class: 'pg__phase' },
+          el('strong', {}, `Step ${ctx.step}`),
+          ...(data.calls ?? []).map((call) =>
+            el('div', { class: 'pg__call' },
+              el('strong', {}, call.name),
+              Object.keys(call.params ?? {}).length
+                ? el('span', {}, ` with ${JSON.stringify(call.params)}`)
+                : el('span', { class: 'muted' }, ' with no parameters'))),
+          chosen.length === 0
+            ? el('div', { class: 'pg__reason' },
+                'Called nothing — it had what it needed, or nothing fitted.')
+            : null));
+      return;
+    }
 
     mount(ctx.bubbleRef.traceList,
       el('div', { class: 'pg__phase' },

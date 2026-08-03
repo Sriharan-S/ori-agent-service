@@ -33,6 +33,10 @@ or a management API.
   between them.
 - **Ambiguity that asks instead of guessing.** When a lookup could mean several
   records, the agent returns a clarifying question and remembers the answer.
+- **A knowledge base.** Upload PDFs, Word files, text or pasted notes describing
+  what the application *is*. They help the agent pick the right function,
+  explain what a result means, and answer questions no function covers — with
+  per-role visibility and hybrid retrieval.
 
 ## It has no database of its own
 
@@ -55,11 +59,28 @@ POST /v1/chat/stream          X-Api-Key + end-user identity
   ├─ ApiKeyGuard ──────── authenticate the application, resolve the end user
   ├─ Router ───────────── read | write | conversational | clarification-reply
   ├─ Registry ─────────── the live functions this role may call
-  ├─ Planner (LLM) ────── choose 1-3 functions, extract parameters
-  ├─ Executor ─────────── validate → check RBAC → bind scopes → run → audit
+  ├─ Retrieval ────────── knowledge passages this role may see
+  │
+  ├─ Agent loop ───────── up to N times:
+  │    ├─ model picks one function (native tool call) — or declines
+  │    ├─ Executor: validate → check RBAC → bind scopes → run → audit
+  │    └─ model reads the result and decides what is next
+  │
   ├─ Reflector ────────── ambiguous? stop and ask. otherwise answer.
   └─ Synthesizer (LLM) ── stream the answer, or the clarifying question
 ```
+
+The loop is the part worth understanding. The model chooses **one** function,
+sees what it returned, and then chooses again — so a request like "generate the
+report for Priya", where the second call needs an id the first call produces,
+is something it observes rather than something it has to predict. It is also
+free to call nothing at all: `tool_choice` is always `auto`, which makes "no
+function here fits that" an answer the model can give instead of picking the
+closest match and filling in a blank parameter.
+
+A call rejected by the parameter validator is a turn, not a failure. The
+validator's complaint goes back to the model, which usually corrects it on the
+next step. The user never sees that complaint — see *Two audiences* below.
 
 Two database connections, deliberately different:
 
@@ -217,6 +238,80 @@ history and the review checklist.
 
 ---
 
+## The knowledge base
+
+Functions tell the agent what it can *look up*. They say nothing about what any
+of it means — what a "level" is, how credits are consumed, what a band on a
+score signifies. Documents fill that in.
+
+Upload them under **Knowledge** in the console: PDF, Word (`.docx`), text,
+Markdown, CSV, or pasted straight in. Each document declares which roles may
+retrieve it, in the same shape as a function's `allowedRoles`, and the filter is
+applied in SQL before ranking — a document a role may not see cannot influence
+what that role gets back.
+
+They are used in four places, and the framing differs in each because the risk
+does:
+
+| Where | What it does | The rule |
+|---|---|---|
+| Choosing a function | Maps the user's words onto the right function | Background only. Never a fact. |
+| Writing an answer | Explains what a returned number means | Live results always win |
+| No function fits | Answers from the documentation, with `[1]` citations | Must say when the docs do not cover it |
+| "What can you do" | Describes the product, not a list of functions | Only what is configured |
+
+The first row is the one to be careful about: a model handed documentation while
+it is choosing a function will otherwise answer *from* the documentation, and
+report a balance it read in a worked example. The grounding block says
+explicitly that it is documentation and not data.
+
+### Retrieval
+
+Hybrid, because the two halves fail on opposite inputs. Postgres full-text
+search is exact and cannot match "how much does it cost" against a section
+headed "Pricing"; vector search does that and will confidently return something
+adjacent when the user typed a product code. Both run, and the ranks are fused
+with Reciprocal Rank Fusion — ordering only, never raw scores, which are not on
+comparable scales.
+
+The vector half is **optional**:
+
+- **No embedding model configured** → lexical search only. Works out of the box,
+  weaker on paraphrase. The Knowledge page says so in a banner rather than
+  leaving you guessing.
+- **An embedding model configured** → hybrid. Add one on the Models page with
+  purpose `embedding`. It is a separate purpose because it is a separate API
+  shape, and because the provider running your chat models often cannot embed at
+  all — Groq, for instance, hosts no embedding model, so a deployment planning
+  on Groq points this at OpenAI, Jina, a local Ollama, or anything else speaking
+  `/v1/embeddings`.
+- **pgvector present** → distances are computed in Postgres. Detected at
+  migration time; without it the same vectors live in a `REAL[]` column and are
+  compared in the service, which is fine into the low thousands of passages.
+
+Adding an embedding model after uploading documents does not mean uploading them
+again — the extracted text is kept, and **Re-index all** rebuilds from it.
+
+---
+
+## Two audiences, two vocabularies
+
+A failed call produces two different sentences, and keeping them apart is what
+stopped `find_user needs at least one of: email, userid.` from being shown to
+end users:
+
+- `result.message` is user-facing and deliberately vague.
+- `operatorDetail` is the specific one. It goes to the audit row, the trace
+  channel, and the agent loop — which can only correct a mistake it is told the
+  shape of. It never reaches the user.
+
+The same split governs what the model sees. Inside the loop it reads
+*observations*, which carry mechanical detail so it can retry properly. The
+synthesizer reads *evidence*, which is humanised and stripped of ids and failure
+mechanics, because whatever it sees it may repeat.
+
+---
+
 ## End-user identity
 
 Configured per application:
@@ -263,7 +358,8 @@ src/
   llm/            model registry, streaming provider, failover
   management/     function/application management services + API
   memory/         conversations, pending disambiguation
-  orchestrator/   router, planner, executor, reflector, synthesizer
+  knowledge/      documents, extraction, chunking, embeddings, hybrid retrieval
+  orchestrator/   router, agent loop, executor, reflector, synthesizer
   registry/       function contract, SQL template engine, runners, validator
   setup/          onboarding: stage detection, manual DDL, first account
   audit/          per-call audit records
@@ -274,6 +370,7 @@ public/           the console — plain modules, no build step, no CDN
   app.js          API client, hash router, sidebar shell
   views.js        activity, functions, roles, models, applications, database
   function-editor.js   the authoring page
+  knowledge.js    document upload, visibility, re-indexing
   setup.js        the onboarding wizard
   guide.js        the in-app manual
 test/             unit, security, eval
@@ -299,16 +396,28 @@ npm run build
 Working end to end: tenancy, API keys, both identity modes, data-driven roles,
 the DB-backed registry with save-time validation, SQL and HTTP function
 execution, scope binding, disambiguation, streaming chat, audit, the management
-API, and the console.
+API, the console, the agent loop with native tool-calling, and the knowledge
+base with hybrid retrieval.
 
 Not built yet:
 
-- **Tool retrieval at scale.** Below ~30 functions the full catalogue goes to
-  the planner, which is correct and simpler. Past that it needs an embedding
-  shortlist.
+- **Tool retrieval at scale.** Below ~30 functions the whole catalogue goes to
+  the model as tools, which is correct and simpler. Past that it needs an
+  embedding shortlist — the machinery for one now exists in `knowledge/`, but it
+  is not wired to the catalogue.
+- **An ANN index on the knowledge vectors.** pgvector, when present, computes
+  distances in the database but without an HNSW index, because the index needs a
+  fixed dimension and the dimension belongs to whichever embedding model the
+  operator chose. Sequential distance is fine into the low tens of thousands of
+  passages.
 - **Confirmation-before-execution.** `requiresConfirmation` is stored and
   surfaced but the two-turn confirm flow is not implemented, so mark
-  destructive actions carefully until it is.
+  destructive actions carefully until it is. The loop makes this more pressing,
+  not less: it can now reach a write action in the same turn as the lookup that
+  found its target.
+- **Ingestion is synchronous.** A document is extracted, chunked and embedded
+  inside the request that uploaded it. Right for one file at a time and an
+  operator watching the screen; wrong for a bulk import, which needs a queue.
 - **Redis-backed rate limiting and caches.** Both are in-process, so limits are
   per-replica. Fix before scaling out.
 
