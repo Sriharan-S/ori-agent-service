@@ -203,7 +203,10 @@ export async function playgroundView() {
     if (replaceFrom) truncateFrom(replaceFrom);
 
     const userTurn = addBubble(transcript, 'user', message, { onEdit: startEdit });
-    const bubbleRef = addBubble(transcript, 'agent', '', { onRetry: retry });
+    const bubbleRef = addBubble(transcript, 'agent', '', {
+      onRetry: retry,
+      onRate: rate,
+    });
     session.turns.push(userTurn, bubbleRef);
     const showTrace = traceToggle.checked;
 
@@ -311,9 +314,15 @@ export async function playgroundView() {
         turn.who === 'user' && turn.messageId != null && !session.streaming && !turn.editing;
       const retryable = turn === lastAgent && !session.streaming && lastUserBefore(turn)?.messageId != null;
 
-      turn.actions.hidden = !(editable || retryable);
+      // Any finished answer can be rated, not just the last one — the one worth
+      // complaining about is often three turns back.
+      const rateable =
+        turn.who === 'agent' && !session.streaming && turn.messageId != null;
+
+      turn.actions.hidden = !(editable || retryable || rateable);
       if (turn.editButton) turn.editButton.hidden = !editable;
       if (turn.retryButton) turn.retryButton.hidden = !retryable;
+      if (turn.rateBar) turn.rateBar.hidden = !rateable;
     }
   }
 
@@ -329,6 +338,43 @@ export async function playgroundView() {
   const retry = (turn) => {
     const source = lastUserBefore(turn);
     if (source) void send(source.text, { replaceFrom: source });
+  };
+
+  /**
+   * Send a rating.
+   *
+   * Goes to the chat API with the same key the conversation used, because that
+   * is the endpoint a real host application will call — testing it here is the
+   * point of the playground. Only the identifiers travel; the service reads the
+   * question, the answer and the calls out of its own tables.
+   */
+  const rate = async (turn, rating, comment) => {
+    const key = apiKey.value.trim();
+    if (!key) { toast('Paste an issued API key first.', 'bad'); return; }
+
+    try {
+      const response = await fetch('/v1/chat/feedback', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': key },
+        body: JSON.stringify({
+          rating,
+          comment,
+          runId: turn.runId,
+          assistantMessageId: turn.messageId,
+          conversationId: session.conversationId,
+        }),
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.message || `Failed (${response.status})`);
+      }
+
+      toast(rating === 'up' ? 'Thanks — noted.' : 'Noted. It is in the review queue.', 'ok');
+    } catch (error) {
+      turn.rating = null;
+      toast(error.message, 'bad');
+    }
   };
 
   sendBtn.onclick = () => void send();
@@ -457,6 +503,9 @@ function handleEvent(event, ctx) {
 
   if (name === 'run.started') {
     ctx.session.conversationId = data.conversationId ?? ctx.session.conversationId;
+    // Held so a later rating can name the run, which is what joins it to the
+    // audit rows describing what actually ran.
+    if (ctx.bubbleRef) ctx.bubbleRef.runId = data.runId ?? null;
     return;
   }
 
@@ -516,6 +565,9 @@ function handleEvent(event, ctx) {
   }
 
   if (name === 'run.completed') {
+    // `functionsUsed` arrives on the user channel, so the collapsed summary
+    // still names them for a caller whose key carries no trace scope.
+    (data.functionsUsed ?? []).forEach((fn) => ctx.bubbleRef.noteFunction(fn));
     ctx.bubbleRef.finishStages(data.latencyMs);
     if (data.responseType && data.responseType !== 'answer') {
       mount(ctx.bubbleRef.bubble, el('div', { class: 'pg__tag' }, statusBadge(data.responseType)));
@@ -607,6 +659,8 @@ function handleEvent(event, ctx) {
     return;
   }
 
+  if (name === 'function.completed') ctx.bubbleRef.noteFunction(data.name);
+
   const simple = {
     'function.started': () => `Running ${data.name}…`,
     'function.completed': () =>
@@ -636,7 +690,7 @@ function handleEvent(event, ctx) {
  * These answers are a few hundred characters, so rebuilding a small fragment per
  * delta costs nothing measurable.
  */
-function addBubble(transcript, who, text, { onEdit, onRetry } = {}) {
+function addBubble(transcript, who, text, { onEdit, onRetry, onRate } = {}) {
   const body = el('div', { class: 'pg__text' });
   const traceList = el('div', { class: 'pg__trace', hidden: true });
 
@@ -652,11 +706,36 @@ function addBubble(transcript, who, text, { onEdit, onRetry } = {}) {
       el('span', { class: 'pg__stage-mark' }),
       el('span', { class: 'pg__stage-label' }, label),
       time);
-    rows.set(key, { row, time });
+    rows.set(key, { row, time, label });
     stageTrack.append(row);
   }
 
   const thinking = el('div', { class: 'pg__thinking', hidden: true });
+
+  /*
+   * The whole trace, behind one disclosure.
+   *
+   * Collapsed by default and titled with whatever the agent is doing right now,
+   * so a running turn reads as one live line instead of a wall that reflows on
+   * every event. Opening it reveals the stages, the agent's own reasoning and
+   * the function calls — the detail an operator wants when something looks
+   * wrong, and nobody wants when it does not.
+   *
+   * `<details>` rather than a click handler and a class: it is keyboard
+   * accessible, it is what a screen reader already understands, and the open
+   * state survives re-renders for free.
+   */
+  const processTitle = el('span', { class: 'pg__process-title' }, 'Thinking…');
+  const processMeta = el('span', { class: 'pg__process-meta' });
+  const processSpinner = el('span', { class: 'pg__process-spin' });
+
+  const process = el('details', { class: 'pg__process' },
+    el('summary', { class: 'pg__process-head' },
+      processSpinner,
+      processTitle,
+      processMeta,
+      el('span', { class: 'pg__process-caret' }, icon('chevron', 13))),
+    el('div', { class: 'pg__process-body' }, stageTrack, thinking, traceList));
 
   // Hidden until the caller decides the turn can actually be acted on — a user
   // turn needs the id the service assigned it, and only the last answer is
@@ -667,6 +746,10 @@ function addBubble(transcript, who, text, { onEdit, onRetry } = {}) {
     who,
     /** Set from `turn.recorded`; null means the service cannot rewind to it. */
     messageId: null,
+    /** Set from `run.started`, so a rating can name the run it is about. */
+    runId: null,
+    rating: null,
+    rateBar: null,
     editing: false,
     get text() { return this._raw ?? ''; },
     _raw: text,
@@ -710,6 +793,15 @@ function addBubble(transcript, who, text, { onEdit, onRetry } = {}) {
       }
 
       this._active = key;
+      // The disclosure is collapsed, so its title is the only progress most
+      // people will see. It has to name the phase that is actually running.
+      processTitle.textContent = rows.get(key).label;
+    },
+
+    /** Function names seen this turn, for the collapsed summary. */
+    _functions: [],
+    noteFunction(name) {
+      if (name && !this._functions.includes(name)) this._functions.push(name);
     },
 
     /** Everything finished. Left on screen — the timings are the point. */
@@ -725,6 +817,15 @@ function addBubble(transcript, who, text, { onEdit, onRetry } = {}) {
       if (latencyMs !== undefined) {
         stageTrack.append(el('div', { class: 'pg__stage-total' }, `${latencyMs}ms total`));
       }
+
+      // Once it is over, "Writing the answer" is not useful. What was done is.
+      const elapsed = latencyMs ?? Math.round(now - (this._startedAt ?? now));
+      process.classList.add('is-done');
+      processSpinner.hidden = true;
+      processTitle.textContent = `Thought for ${(elapsed / 1000).toFixed(1)}s`;
+      processMeta.textContent = this._functions.length
+        ? `· ${this._functions.join(', ')}`
+        : '';
     },
 
     /** Stops the spinner on the phase that failed, so it stays visible. */
@@ -735,6 +836,11 @@ function addBubble(transcript, who, text, { onEdit, onRetry } = {}) {
         }
       }
       this._active = 'done';
+      process.classList.add('is-done', 'is-failed');
+      processSpinner.hidden = true;
+      processTitle.textContent = 'Stopped';
+      // Opened on failure: the trace is the reason anyone is looking.
+      process.open = true;
     },
 
     /** A line of the agent's own reasoning, as it arrives. */
@@ -764,15 +870,51 @@ function addBubble(transcript, who, text, { onEdit, onRetry } = {}) {
     mount(actions, turn.retryButton);
   }
 
+  if (onRate) {
+    /*
+     * Thumbs on the answer.
+     *
+     * A dislike asks for a reason, because "this was wrong" and "this was wrong
+     * because it used the registration id" are worth very different amounts to
+     * whoever reads the queue. It is optional — refusing to record a rating
+     * without an explanation would mean recording far fewer of them.
+     */
+    const up = el('button', {
+      class: 'iconbtn', type: 'button', title: 'This answer was good',
+    }, icon('up', 14));
+    const down = el('button', {
+      class: 'iconbtn', type: 'button', title: 'Something was wrong with this answer',
+    }, icon('down', 14));
+
+    const paint = () => {
+      up.className = `iconbtn ${turn.rating === 'up' ? 'is-on' : ''}`;
+      down.className = `iconbtn ${turn.rating === 'down' ? 'is-on--bad' : ''}`;
+    };
+
+    up.onclick = async () => {
+      turn.rating = 'up';
+      paint();
+      await onRate(turn, 'up', null);
+    };
+
+    down.onclick = async () => {
+      const comment = prompt('What was wrong with it? (optional)') ?? '';
+      turn.rating = 'down';
+      paint();
+      await onRate(turn, 'down', comment.trim() || null);
+    };
+
+    turn.rateBar = el('div', { class: 'pg__rate' }, up, down);
+    mount(actions, turn.rateBar);
+  }
+
   turn.bubble = el('div', { class: `pg__bubble pg__bubble--${who}` },
     el('div', { class: 'pg__who' },
       el('span', { class: 'avatar', style: who === 'agent' ? '' : 'background:var(--bg-subtle);color:var(--text-muted)' },
         who === 'agent' ? 'O' : 'U'),
       el('span', {}, who === 'agent' ? 'Agent' : 'You'),
       actions),
-    who === 'agent' ? stageTrack : null,
-    who === 'agent' ? thinking : null,
-    who === 'agent' ? traceList : null,
+    who === 'agent' ? process : null,
     body);
 
   if (who === 'user') body.textContent = text;

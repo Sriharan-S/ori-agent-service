@@ -11,6 +11,7 @@ import {
   MinLength,
   ValidateNested,
 } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import type { Candidate } from '../../registry/function.contract';
 
 export class ClientContextDto {
@@ -60,6 +61,41 @@ export class ChatRequestDto {
   @ValidateNested()
   @Type(() => ClientContextDto)
   clientContext?: ClientContextDto;
+}
+
+/**
+ * A rating for one answer.
+ *
+ * Carries identifiers only. The question, the answer and the functions that ran
+ * are read from the agent's own records, so a client cannot describe a run
+ * differently from how it happened.
+ */
+export class FeedbackRequestDto {
+  @ApiProperty({ enum: ['up', 'down'], description: 'The verdict.' })
+  @IsString()
+  rating!: 'up' | 'down';
+
+  @ApiPropertyOptional({ description: 'From the response being rated.' })
+  @IsOptional()
+  @IsString()
+  runId?: string | null;
+
+  @ApiPropertyOptional({ description: 'The turn being rated.' })
+  @IsOptional()
+  @IsInt()
+  assistantMessageId?: number | null;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  conversationId?: string | null;
+
+  @ApiPropertyOptional({
+    description: 'What was wrong, in the user\'s words. Optional but the most useful part.',
+  })
+  @IsOptional()
+  @IsString()
+  comment?: string | null;
 }
 
 export interface ChatResponseDto {

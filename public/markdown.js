@@ -82,6 +82,107 @@ function renderInline(target, text) {
 }
 
 /**
+ * Split one table row into cells.
+ *
+ * The outer pipes are optional in GFM, so they are trimmed before splitting
+ * rather than producing phantom empty cells at each end. `\|` is an escaped
+ * pipe and must survive as a literal.
+ */
+function splitRow(line) {
+  return line
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split(/(?<!\\)\|/)
+    .map((cell) => cell.replace(/\\\|/g, '|').trim());
+}
+
+/**
+ * A table needs a header row and a delimiter row directly beneath it.
+ *
+ * Requiring the delimiter is what stops an ordinary sentence containing a pipe
+ * — or a row of data the model formatted by hand — from being swallowed as a
+ * malformed table.
+ */
+function isTableStart(lines, index) {
+  const header = lines[index];
+  const delimiter = lines[index + 1];
+
+  if (!header || !delimiter) return false;
+  if (!header.includes('|')) return false;
+  if (!/^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$/.test(delimiter)) {
+    return false;
+  }
+
+  return splitRow(header).length === splitRow(delimiter).length;
+}
+
+/** `:---`, `---:` and `:---:` map to the three alignments. */
+function alignmentOf(cell) {
+  const left = cell.startsWith(':');
+  const right = cell.endsWith(':');
+  if (left && right) return 'center';
+  if (right) return 'right';
+  if (left) return 'left';
+  return null;
+}
+
+/**
+ * Build the table and report how many lines it used.
+ *
+ * Wrapped in a scrolling container: an answer comparing eight columns should
+ * scroll inside its own bubble rather than widening the whole conversation.
+ */
+function renderTable(fragment, lines, start) {
+  const headers = splitRow(lines[start]);
+  const alignments = splitRow(lines[start + 1]).map(alignmentOf);
+
+  const table = document.createElement('table');
+  table.className = 'md-table';
+
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  headers.forEach((text, column) => {
+    const cell = document.createElement('th');
+    if (alignments[column]) cell.style.textAlign = alignments[column];
+    renderInline(cell, text);
+    headRow.append(cell);
+  });
+  thead.append(headRow);
+  table.append(thead);
+
+  const tbody = document.createElement('tbody');
+  let index = start + 2;
+
+  while (index < lines.length && lines[index].trim() !== '' && lines[index].includes('|')) {
+    const values = splitRow(lines[index]);
+    const row = document.createElement('tr');
+
+    headers.forEach((_header, column) => {
+      const cell = document.createElement('td');
+      // Labelled for the stylesheet's narrow-screen card layout, the same way
+      // the console's own tables are.
+      cell.setAttribute('data-label', headers[column] ?? '');
+      if (alignments[column]) cell.style.textAlign = alignments[column];
+      renderInline(cell, values[column] ?? '');
+      row.append(cell);
+    });
+
+    tbody.append(row);
+    index += 1;
+  }
+
+  table.append(tbody);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'md-tablewrap';
+  wrap.append(table);
+  fragment.append(wrap);
+
+  return index - start;
+}
+
+/**
  * Render markdown into a fresh fragment.
  *
  * Block handling is line-based: consecutive list items become one list, blank
@@ -115,6 +216,14 @@ export function renderMarkdown(source) {
       pre.className = 'md-code';
       pre.textContent = body.join('\n');
       fragment.append(pre);
+      continue;
+    }
+
+    // Pipe table. Needs the delimiter row on the next line to qualify, which is
+    // what keeps a sentence containing a pipe from being read as a table.
+    if (isTableStart(lines, index)) {
+      const consumed = renderTable(fragment, lines, index);
+      index += consumed;
       continue;
     }
 

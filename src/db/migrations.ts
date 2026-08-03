@@ -50,6 +50,7 @@ export const AGENT_TABLES = [
   'agent_audit_log',
   'agent_documents',
   'agent_document_chunks',
+  'agent_feedback',
 ] as const;
 
 export function buildMigrations(schema: string): Migration[] {
@@ -584,6 +585,61 @@ export function buildMigrations(schema: string): Migration[] {
           ADD COLUMN IF NOT EXISTS embedding_query_prefix   TEXT,
           ADD COLUMN IF NOT EXISTS embedding_passage_prefix TEXT,
           ADD COLUMN IF NOT EXISTS extra_headers_encrypted  TEXT;
+      `,
+    },
+
+    {
+      /**
+       * What people thought of an answer.
+       *
+       * The question and the answer are snapshotted rather than referenced.
+       * `agent_messages` cascades from `agent_conversations`, so a deleted
+       * conversation would take the evidence with it — and the whole point of a
+       * dislike is that it outlives the conversation it came from.
+       *
+       * The *reasoning* is not stored here. `run_key` already points at
+       * `agent_runs` and `agent_audit_log`, which hold every function call with
+       * its parameters, status and timing — recorded by the executor as it ran,
+       * not reported by the client afterwards. Copying that in would duplicate
+       * it and make it forgeable at the same time.
+       */
+      id: '0013_feedback',
+      sql: `
+        CREATE TABLE IF NOT EXISTS ${s}.agent_feedback (
+          id               BIGSERIAL PRIMARY KEY,
+          application_id   BIGINT      NOT NULL REFERENCES ${s}.agent_applications(id) ON DELETE CASCADE,
+          conversation_key TEXT,
+          -- Joins to agent_runs and agent_audit_log for the full trace.
+          run_key          TEXT,
+          -- The assistant turn being rated.
+          message_id       BIGINT,
+          rating           TEXT        NOT NULL,
+          comment          TEXT,
+          question         TEXT        NOT NULL DEFAULT '',
+          answer           TEXT        NOT NULL DEFAULT '',
+          functions_used   TEXT[]      NOT NULL DEFAULT ARRAY[]::TEXT[],
+          end_user_id      TEXT,
+          end_user_role    TEXT,
+          -- Cleared when someone has looked at it, so a review queue is
+          -- possible without a second table.
+          reviewed_at      TIMESTAMPTZ,
+          created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+          CONSTRAINT agent_feedback_rating_check CHECK (rating IN ('up', 'down'))
+        );
+
+        CREATE INDEX IF NOT EXISTS agent_feedback_recent_idx
+          ON ${s}.agent_feedback (application_id, created_at DESC);
+
+        -- The review queue: bad answers nobody has looked at yet.
+        CREATE INDEX IF NOT EXISTS agent_feedback_open_idx
+          ON ${s}.agent_feedback (application_id, created_at DESC)
+          WHERE rating = 'down' AND reviewed_at IS NULL;
+
+        -- One verdict per turn. Changing your mind updates it rather than
+        -- adding a second, contradictory row.
+        CREATE UNIQUE INDEX IF NOT EXISTS agent_feedback_turn_idx
+          ON ${s}.agent_feedback (run_key, message_id)
+          WHERE run_key IS NOT NULL AND message_id IS NOT NULL;
       `,
     },
   ];

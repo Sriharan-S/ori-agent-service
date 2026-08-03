@@ -16,6 +16,7 @@ import {
 import { OriConfigModule } from './config/config.module';
 import { loadConfiguration } from './config/configuration';
 import { DbModule } from './db/db.module';
+import { FeedbackModule } from './feedback/feedback.module';
 import { LlmModule } from './llm/llm.module';
 import { ManagementModule } from './management/management.module';
 import { MemoryModule } from './memory/memory.module';
@@ -65,6 +66,7 @@ const config = loadConfiguration();
     LlmModule,
     AuditModule,
     MemoryModule,
+    FeedbackModule,
     RegistryModule,
     OrchestratorModule,
     ManagementModule,

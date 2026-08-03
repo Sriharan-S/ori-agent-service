@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Logger,
@@ -20,7 +21,12 @@ import { RateLimitGuard } from '../auth/rate-limit.guard';
 import type { RequestContext } from '../auth/identity';
 import { OrchestratorService } from '../orchestrator/orchestrator.service';
 import type { AgentEvent } from '../orchestrator/orchestrator.types';
-import { ChatRequestDto, type ChatResponseDto } from './dto/chat.dto';
+import { FeedbackService } from '../feedback/feedback.service';
+import {
+  ChatRequestDto,
+  FeedbackRequestDto,
+  type ChatResponseDto,
+} from './dto/chat.dto';
 
 /**
  * The chat API.
@@ -50,7 +56,49 @@ import { ChatRequestDto, type ChatResponseDto } from './dto/chat.dto';
 export class ChatController {
   private readonly logger = new Logger(ChatController.name);
 
-  constructor(private readonly orchestrator: OrchestratorService) {}
+  constructor(
+    private readonly orchestrator: OrchestratorService,
+    private readonly feedback: FeedbackService,
+  ) {}
+
+  /**
+   * Rate an answer.
+   *
+   * Deliberately on the chat API rather than the console: the person who can
+   * tell whether an answer was any good is the one who asked, and they are
+   * using the host application. The console reads the queue this fills.
+   *
+   * Only the identifiers are accepted. What was asked, what was answered, and
+   * what ran are read back out of the agent's own tables — a rating that
+   * carried its own account of the run would be evidence of nothing.
+   */
+  @Post('feedback')
+  @ApiOperation({
+    summary: 'Rate an answer',
+    description:
+      'Records a thumbs up or down against a turn. Send the `runId` and the ' +
+      '`assistantMessageId` from the response being rated. Rating the same ' +
+      'turn again replaces the previous verdict rather than adding a second.',
+  })
+  @ApiResponse({ status: 201, description: 'Recorded.' })
+  async rate(
+    @Body() body: FeedbackRequestDto,
+    @Ctx() context: RequestContext,
+  ): Promise<{ id: number; rating: string }> {
+    if (body.rating !== 'up' && body.rating !== 'down') {
+      throw new BadRequestException('rating must be "up" or "down".');
+    }
+
+    const record = await this.feedback.record(context, {
+      rating: body.rating,
+      conversationId: body.conversationId ?? null,
+      runId: body.runId ?? null,
+      messageId: body.assistantMessageId ?? null,
+      comment: body.comment ?? null,
+    });
+
+    return { id: record.id, rating: record.rating };
+  }
 
   @Post()
   @ApiOperation({

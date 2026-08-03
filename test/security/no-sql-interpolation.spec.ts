@@ -55,6 +55,11 @@ const ALLOWED_FRAGMENTS = new Set([
    * is a value and values get bound.
    */
   'SUMMARY_COLUMNS',
+  // Fixed column list constant in feedback/feedback.service.ts. Same category
+  // again. Named for its table rather than called `COLUMNS`, so this entry
+  // cannot later wave through some unrelated constant that happens to share a
+  // generic name.
+  'FEEDBACK_COLUMNS',
   /*
    * Scope-sample lookup in database-info.service.ts.
    *

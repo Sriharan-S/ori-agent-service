@@ -17,6 +17,7 @@ import { functionEditor } from './function-editor.js';
 import { guideView } from './guide.js';
 import { playgroundView } from './playground.js';
 import { knowledgeView } from './knowledge.js';
+import { feedbackView } from './feedback.js';
 
 export const state = {
   user: null,
@@ -64,6 +65,7 @@ const NAV = [
       { id: 'playground', label: 'Playground', icon: 'play' },
       { id: 'conversations', label: 'Conversations', icon: 'chat' },
       { id: 'audit', label: 'Audit log', icon: 'audit' },
+      { id: 'feedback', label: 'Feedback', icon: 'up' },
     ],
   },
   {
@@ -90,6 +92,7 @@ const TITLES = {
   playground: 'Playground',
   conversations: 'Conversations',
   audit: 'Audit log',
+  feedback: 'Feedback',
   functions: 'Functions',
   'function-new': 'New function',
   'function-edit': 'Edit function',
@@ -364,6 +367,7 @@ const PAGES = {
   ...views,
   playground: () => playgroundView(),
   knowledge: () => knowledgeView(),
+  feedback: () => feedbackView(),
   'function-new': () => functionEditor(null),
   'function-edit': (params) => functionEditor(params.name),
   guide: (params) => guideView(params.section),

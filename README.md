@@ -37,6 +37,8 @@ or a management API.
   what the application *is*. They help the agent pick the right function,
   explain what a result means, and answer questions no function covers — with
   per-role visibility and hybrid retrieval.
+- **Feedback that lands next to the evidence.** A thumbs down is recorded with
+  the question, the answer, and every function call the executor actually made.
 
 ## It has no database of its own
 
@@ -294,6 +296,30 @@ again — the extracted text is kept, and **Re-index all** rebuilds from it.
 
 ---
 
+## Feedback
+
+```
+POST /v1/chat/feedback
+{"rating":"down","runId":"…","assistantMessageId":270,"comment":"wrong programme"}
+```
+
+Any client can call it — the playground does, and so should your application.
+Send the `runId` and `assistantMessageId` from the response being rated; rating
+the same turn again replaces the previous verdict rather than adding a second.
+
+Only identifiers are accepted. The question, the answer and the functions used
+are read back out of the agent's own tables, and the per-call detail — every
+function, its parameters, the scopes bound to it, its result and its timing —
+comes from `agent_audit_log`, written by the executor as it ran. A client cannot
+describe a run differently from how it happened.
+
+**Feedback** in the console is the queue. A dislike stays in it until someone
+marks it reviewed, and opening one shows the exchange beside what actually ran —
+which is usually enough to see that a function's description sent the model
+somewhere it should not have gone.
+
+---
+
 ## Two audiences, two vocabularies
 
 A failed call produces two different sentences, and keeping them apart is what
@@ -358,6 +384,7 @@ src/
   llm/            model registry, streaming provider, failover
   management/     function/application management services + API
   memory/         conversations, pending disambiguation
+  feedback/       ratings, joined to the run that produced them
   knowledge/      documents, extraction, chunking, embeddings, hybrid retrieval
   orchestrator/   router, agent loop, executor, reflector, synthesizer
   registry/       function contract, SQL template engine, runners, validator
@@ -371,6 +398,7 @@ public/           the console — plain modules, no build step, no CDN
   views.js        activity, functions, roles, models, applications, database
   function-editor.js   the authoring page
   knowledge.js    document upload, visibility, re-indexing
+  feedback.js     the review queue for rated answers
   setup.js        the onboarding wizard
   guide.js        the in-app manual
 test/             unit, security, eval

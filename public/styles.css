@@ -1148,6 +1148,73 @@ pre.code.tall { max-height: 340px; overflow-y: auto; }
 }
 @keyframes pg-spin { to { transform: rotate(360deg); } }
 
+/* The thinking process, behind a disclosure.
+ *
+ * Collapsed, a running turn is one live line rather than a block that reflows
+ * on every event. The summary carries the current phase while it runs and what
+ * was done once it finishes. */
+.pg__process {
+  margin: 0 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: oklch(from var(--bg-subtle) l c h / 0.5);
+}
+.pg__process-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-muted);
+  list-style: none;
+  user-select: none;
+}
+.pg__process-head::-webkit-details-marker { display: none; }
+.pg__process-head:hover { color: var(--text); }
+.pg__process-title { font-weight: 500; }
+.pg__process-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pg__process-caret {
+  display: inline-flex;
+  margin-left: auto;
+  transition: transform 120ms ease;
+}
+.pg__process[open] .pg__process-caret { transform: rotate(180deg); }
+.pg__process-body {
+  padding: 2px 10px 8px;
+  border-top: 1px solid var(--border);
+}
+.pg__process.is-failed { border-color: var(--bad); }
+
+/* A small spinner while the run is live; hidden once it settles. */
+.pg__process-spin {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  border-radius: 50%;
+  border: 1.5px solid var(--border);
+  border-top-color: var(--accent);
+  animation: pg-spin 700ms linear infinite;
+}
+@keyframes pg-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .pg__process-spin { animation: none; }
+}
+
+/* Feedback on an answer. */
+.pg__rate { display: inline-flex; gap: 2px; margin-left: auto; }
+.pg__rate .iconbtn { padding: 3px; opacity: 0.55; }
+.pg__rate .iconbtn:hover { opacity: 1; }
+.pg__rate .iconbtn.is-on { opacity: 1; color: var(--accent); }
+.pg__rate .iconbtn.is-on--bad { opacity: 1; color: var(--bad); }
+
 /* Markdown inside an answer. */
 .pg__text > :first-child { margin-top: 0; }
 .pg__text > :last-child { margin-bottom: 0; }
@@ -1171,6 +1238,54 @@ pre.code.tall { max-height: 340px; overflow-y: auto; }
   font-size: 11.5px;
   white-space: pre;
 }
+/* Tables inside an answer.
+ *
+ * The wrapper scrolls rather than the page: a comparison across eight columns
+ * should stay inside its own bubble instead of widening the conversation. */
+.pg__text .md-tablewrap {
+  margin: 8px 0;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.pg__text .md-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.pg__text .md-table th,
+.pg__text .md-table td {
+  padding: 6px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.pg__text .md-table th {
+  font-weight: 600;
+  background: oklch(from currentColor l c h / 0.05);
+}
+.pg__text .md-table tbody tr:last-child td { border-bottom: 0; }
+
+/* Narrow screens: each row becomes a labelled card, the same treatment the
+ * console's own tables get. */
+@media (max-width: 620px) {
+  .pg__text .md-table thead { display: none; }
+  .pg__text .md-table tr { display: block; border-bottom: 1px solid var(--border); }
+  .pg__text .md-table tr:last-child { border-bottom: 0; }
+  .pg__text .md-table td {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    border-bottom: 0;
+    white-space: normal;
+  }
+  .pg__text .md-table td::before {
+    content: attr(data-label);
+    font-weight: 600;
+    opacity: 0.7;
+  }
+}
+
 .pg__bubble--user .pg__text a { color: inherit; text-decoration: underline; }
 
 .pg__candidates { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }

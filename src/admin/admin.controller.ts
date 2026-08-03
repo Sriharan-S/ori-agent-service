@@ -20,6 +20,7 @@ import {
 import { FileInterceptor } from '@nestjs/platform-express';
 import type { Request, Response } from 'express';
 import { DocumentService } from '../knowledge/document.service';
+import { FeedbackService } from '../feedback/feedback.service';
 import { CONFIG, type AppConfig } from '../config/configuration';
 import { ApiKeyService } from '../auth/api-key.service';
 import type { ApiKeyScope } from '../auth/identity';
@@ -117,6 +118,7 @@ export class AdminController {
     private readonly apiKeys: ApiKeyService,
     private readonly conversations: ConversationService,
     private readonly documents: DocumentService,
+    private readonly feedback: FeedbackService,
   ) {}
 
   // ── Session ────────────────────────────────────────────────────────────────
@@ -331,6 +333,63 @@ export class AdminController {
   async revokeKey(@Param('id', ParseIntPipe) id: number) {
     await this.apiKeys.revoke(id);
     return { revoked: true };
+  }
+
+  // ── Feedback ───────────────────────────────────────────────────────────────
+
+  /** The review queue. `open=true` narrows it to unreviewed dislikes. */
+  @Get('applications/:id/feedback')
+  @UseGuards(AdminSessionGuard)
+  async listFeedback(
+    @Param('id', ParseIntPipe) id: number,
+    @Query('rating') rating?: 'up' | 'down',
+    @Query('open') open?: string,
+  ) {
+    const [feedback, summary] = await Promise.all([
+      this.feedback.list(id, {
+        ...(rating === 'up' || rating === 'down' ? { rating } : {}),
+        onlyOpen: open === 'true',
+      }),
+      this.feedback.summary(id),
+    ]);
+    return { feedback, summary };
+  }
+
+  /** One rating, with the run that produced it and every call it made. */
+  @Get('applications/:id/feedback/:feedbackId')
+  @UseGuards(AdminSessionGuard)
+  async getFeedback(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('feedbackId', ParseIntPipe) feedbackId: number,
+  ) {
+    const detail = await this.feedback.get(id, feedbackId);
+    if (!detail) throw new NotFoundException('No such feedback.');
+    return { feedback: detail };
+  }
+
+  @Post('applications/:id/feedback/:feedbackId/reviewed')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async reviewFeedback(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('feedbackId', ParseIntPipe) feedbackId: number,
+    @Body() body: { reviewed?: boolean },
+  ) {
+    const ok = await this.feedback.setReviewed(id, feedbackId, body.reviewed !== false);
+    if (!ok) throw new NotFoundException('No such feedback.');
+    return { reviewed: body.reviewed !== false };
+  }
+
+  @Delete('applications/:id/feedback/:feedbackId')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async deleteFeedback(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('feedbackId', ParseIntPipe) feedbackId: number,
+  ) {
+    const ok = await this.feedback.remove(id, feedbackId);
+    if (!ok) throw new NotFoundException('No such feedback.');
+    return { deleted: true };
   }
 
   // ── Knowledge ──────────────────────────────────────────────────────────────
