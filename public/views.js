@@ -8,6 +8,7 @@ import {
   toast, busy, csv, parseJson, pageHead,
 } from './ui.js';
 import { api, appPath, state, render, navigate, poll, reloadApplications } from './app.js';
+import { conversationEvidencePanel } from './evidence.js';
 
 export const views = {};
 
@@ -118,6 +119,52 @@ async function showRun(runKey) {
 
 views.functions = async () => {
   const { functions } = await api(appPath('/functions'));
+  const selected = new Set();
+  const rowChecks = [];
+  const bulkButtons = [];
+  const selectedCount = el('span', { class: 'bulk-count' }, '0 selected');
+  const selectAll = el('input', { class: 'row-check', type: 'checkbox', title: 'Select all functions' });
+
+  const syncBulk = () => {
+    selectedCount.textContent = `${selected.size} selected`;
+    for (const control of bulkButtons) control.disabled = selected.size === 0;
+    selectAll.checked = functions.length > 0 && selected.size === functions.length;
+    selectAll.indeterminate = selected.size > 0 && selected.size < functions.length;
+  };
+
+  selectAll.addEventListener('change', () => {
+    selected.clear();
+    if (selectAll.checked) functions.forEach((fn) => selected.add(fn.name));
+    for (const check of rowChecks) check.checked = selected.has(check.value);
+    syncBulk();
+  });
+
+  const rowCheck = (fn) => {
+    const input = el('input', {
+      class: 'row-check',
+      type: 'checkbox',
+      value: fn.name,
+      title: `Select ${fn.name}`,
+      onchange: () => {
+        input.checked ? selected.add(fn.name) : selected.delete(fn.name);
+        syncBulk();
+      },
+    });
+    rowChecks.push(input);
+    return input;
+  };
+
+  const bulk = (status, label, variant = '') => {
+    const control = button(label, {
+      variant,
+      size: 'sm',
+      disabled: true,
+      onclick: (event) => bulkSetFunctionStatus(functions, selected, status, event.currentTarget),
+    });
+    bulkButtons.push(control);
+    return control;
+  };
+
   const hasDemo = functions.some((fn) => fn.name === 'demo');
   const live = functions.filter((fn) => fn.status === 'live').length;
   const liveBeyondDemo = functions.filter(
@@ -162,14 +209,25 @@ views.functions = async () => {
         'your data. Approve them and take them live.'),
       releaseAllButton(pending)) : null,
 
-    panel('Registry', { count: functions.length },
+    panel('Registry', {
+      count: functions.length,
+      tools: functions.length
+        ? [
+            selectedCount,
+            bulk('approved', 'Approve'),
+            bulk('live', 'Enable', 'primary'),
+            bulk('disabled', 'Disable', 'danger'),
+          ]
+        : [],
+    },
       functions.length === 0
         ? empty('No functions yet',
             'The agent can only do what is defined here. Start with the demo, or write one.',
             button('Install the demo function', { variant: 'primary', onclick: installDemo }),
             'functions')
-        : table(['Name', 'Kind', 'Returns', 'Roles', 'Status', 'Ver', ''],
+        : table([selectAll, 'Name', 'Kind', 'Returns', 'Roles', 'Status', 'Ver', ''],
             functions.map((fn) => [
+              rowCheck(fn),
               mount(el('span', { class: 'nowrap' }),
                 el('button', {
                   class: 'linkish',
@@ -218,6 +276,66 @@ function statusActions(fn) {
   if (fn.status === 'approved') return [go('live', 'Go live', 'primary')];
   if (fn.status === 'live') return [go('disabled', 'Disable', 'danger')];
   return [go('approved', 'Re-approve', '')];
+}
+
+async function bulkSetFunctionStatus(functions, selected, status, trigger) {
+  const picked = functions.filter((fn) => selected.has(fn.name));
+  const candidates = picked.filter((fn) => {
+    if (status === 'approved') return fn.status !== 'approved' && fn.status !== 'live';
+    if (status === 'live') return fn.status !== 'live';
+    if (status === 'disabled') return fn.status !== 'disabled';
+    return false;
+  });
+
+  if (picked.length === 0) {
+    toast('Select at least one function.', 'bad');
+    return;
+  }
+
+  if (candidates.length === 0) {
+    toast('The selected functions already have that status.', 'ok');
+    return;
+  }
+
+  if (
+    status === 'disabled' &&
+    !confirm(`Disable ${candidates.length} selected function(s)? They will stop being offered to the agent.`)
+  ) {
+    return;
+  }
+
+  const original = trigger.textContent;
+  trigger.disabled = true;
+
+  const failed = [];
+  let changed = 0;
+
+  for (const fn of candidates) {
+    trigger.textContent = `${original} ${changed + failed.length + 1}/${candidates.length}`;
+    try {
+      await api(appPath(`/functions/${encodeURIComponent(fn.name)}/status`), {
+        method: 'POST',
+        body: { status },
+      });
+      changed += 1;
+    } catch (error) {
+      failed.push(`${fn.name}: ${error.message}`);
+    }
+  }
+
+  if (failed.length === 0) {
+    toast(`${changed} function(s) updated.`, 'ok');
+  } else {
+    toast(`${changed} updated, ${failed.length} refused.`, changed ? 'warn' : 'bad');
+    openModal('Some functions were not updated', frag(
+      notice('Each selected function is still validated by the normal status endpoint.', 'info'),
+      codeBlock(failed.join('\n\n'), { wrap: true }),
+      el('div', { class: 'btnrow btnrow--end', style: 'margin-top:14px' },
+        button('Done', { variant: 'primary', onclick: closeModal })),
+    ), { wide: true });
+  }
+
+  render();
 }
 
 async function installDemo() {
@@ -1051,7 +1169,7 @@ views.conversations = async () => {
       conversations.length === 0
         ? empty('No conversations yet',
             'They appear here as soon as an end user sends a message.', null, 'chat')
-        : table(['Started by', 'Role', 'Title', 'Messages', 'Updated'],
+        : table(['Started by', 'Role', 'Title', 'Messages', 'Updated', ''],
             conversations.map((conversation) => [
               conversation.endUserId,
               conversation.endUserRole,
@@ -1062,15 +1180,33 @@ views.conversations = async () => {
               }, conversation.title || '(untitled)'),
               conversation.messageCount,
               fmt.ago(conversation.updatedAt),
+              el('div', { class: 'cell-actions' },
+                button('Delete', {
+                  variant: 'danger',
+                  size: 'sm',
+                  onclick: (event) => busy(event.target, () =>
+                    deleteConversation(conversation.conversationKey)),
+                })),
             ]))),
   );
 };
 
 async function showTranscript(key) {
-  const { messages } = await api(`/conversations/${key}`);
+  const { messages, runs = [] } = await api(
+    appPath(`/conversations/${encodeURIComponent(key)}`));
   const superseded = messages.filter((message) => message.supersededAt).length;
+  const functionNames = new Set();
+  for (const run of runs) {
+    for (const name of run.functionsUsed ?? []) functionNames.add(name);
+    for (const call of run.calls ?? []) functionNames.add(call.functionName);
+  }
 
   openModal('Transcript', frag(
+    el('div', { class: 'grid' },
+      kpi('Messages', fmt.num(messages.length), { iconName: 'chat' }),
+      kpi('Runs', fmt.num(runs.length), { iconName: 'activity' }),
+      kpi('Functions used', fmt.num(functionNames.size), { iconName: 'functions' })),
+
     // A turn the user edited away is still part of what happened, and it is
     // often the explanation for an answer that otherwise reads as a non
     // sequitur. Shown, dimmed, in place.
@@ -1081,21 +1217,46 @@ async function showTranscript(key) {
           'info')
       : null,
 
-    ...messages.map((message) =>
-      el('div', {
-        class: 'card',
-        style: 'padding:12px 14px;margin-bottom:10px' +
-          (message.supersededAt ? ';opacity:.55;border-style:dashed' : ''),
-      },
-        el('div', { style: 'display:flex;gap:8px;align-items:center;margin-bottom:6px' },
-          badge(message.role, message.role === 'user' ? 'info' : ''),
-          el('span', { class: 'faint', style: 'font-size:11.5px' }, fmt.time(message.createdAt)),
-          message.supersededAt ? badge('replaced', 'warn') : null),
-        el('div', {
-          style: 'font-size:13.5px;line-height:1.6;white-space:pre-wrap' +
-            (message.supersededAt ? ';text-decoration:line-through' : ''),
-        }, message.content))),
+    panel('Messages', { count: messages.length },
+      messages.length === 0
+        ? empty('No messages', 'This conversation has no saved turns.', null, 'chat')
+        : el('div', { class: 'pg__transcript', style: 'max-height:420px' },
+            ...messages.map((message) => transcriptBubble(message)))),
+
+    conversationEvidencePanel(runs),
+
+    el('div', { class: 'btnrow btnrow--end', style: 'margin-top:16px' },
+      button('Delete conversation', {
+        variant: 'danger',
+        onclick: (event) => busy(event.target, () => deleteConversation(key, { close: true })),
+      })),
   ), { wide: true });
+}
+
+function transcriptBubble(message) {
+  const who = message.role === 'assistant' ? 'agent' : 'user';
+  const style = message.supersededAt ? 'opacity:.55' : '';
+
+  return el('div', { class: `pg__bubble pg__bubble--${who}`, style },
+    el('div', { class: 'pg__who' },
+      badge(message.role, message.role === 'user' ? 'info' : ''),
+      el('span', { class: 'faint' }, fmt.time(message.createdAt)),
+      message.supersededAt ? badge('replaced', 'warn') : null),
+    el('div', {
+      class: 'pg__text',
+      style: message.supersededAt ? 'text-decoration:line-through' : '',
+    }, message.content));
+}
+
+async function deleteConversation(key, { close = false } = {}) {
+  if (!confirm('Delete this conversation? Its messages will be removed from the conversation list.')) {
+    return;
+  }
+
+  await api(appPath(`/conversations/${encodeURIComponent(key)}`), { method: 'DELETE' });
+  if (close) closeModal();
+  toast('Conversation deleted.', 'ok');
+  render();
 }
 
 views.audit = async () => {

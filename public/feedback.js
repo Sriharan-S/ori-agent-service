@@ -10,10 +10,11 @@
  */
 
 import {
-  el, frag, fmt, table, panel, kpi, badge, statusBadge, notice, empty, button,
+  el, frag, fmt, table, panel, kpi, badge, notice, empty, button,
   codeBlock, openModal, closeModal, toast, busy, pageHead,
 } from './ui.js';
 import { api, appPath, render } from './app.js';
+import { runEvidencePanel } from './evidence.js';
 
 let filter = { rating: null, open: false };
 
@@ -112,6 +113,20 @@ function truncate(text) {
 
 async function inspect(id) {
   const { feedback } = await api(appPath(`/feedback/${id}`));
+  const calls = feedback.calls ?? [];
+  const evidenceRun = feedback.run ?? (feedback.runKey || calls.length
+    ? {
+        runKey: feedback.runKey,
+        intent: null,
+        responseType: null,
+        status: 'unknown',
+        functionsUsed: feedback.functionsUsed ?? [],
+        latencyMs: null,
+        error: null,
+        startedAt: feedback.createdAt,
+        completedAt: null,
+      }
+    : null);
 
   openModal(
     feedback.rating === 'up' ? 'Liked answer' : 'Disliked answer',
@@ -131,10 +146,6 @@ async function inspect(id) {
         }),
         kpi('Latency', fmt.ms(feedback.run?.latencyMs), { iconName: 'clock' })),
 
-      feedback.run?.error
-        ? notice(`The run failed: ${feedback.run.error}`, 'bad')
-        : null,
-
       panel('The exchange', {},
         el('div', { class: 'pg__transcript', style: 'max-height:260px' },
           el('div', { class: 'pg__bubble pg__bubble--user' },
@@ -142,30 +153,14 @@ async function inspect(id) {
           el('div', { class: 'pg__bubble pg__bubble--agent' },
             el('div', { class: 'pg__text' }, feedback.answer || '(not recorded)')))),
 
-      panel('What actually ran', {
-        count: feedback.calls.length,
-        foot: 'From the audit log, in order.',
-      },
-        feedback.calls.length === 0
-          ? empty('No functions were called',
-              'The agent answered without reaching for data — either it declined, ' +
-              'or it answered from the knowledge base.', null, 'functions')
-          : table(['Function', 'Result', 'Parameters', 'Scopes', 'Rows', 'Time'],
-              feedback.calls.map((call) => [
-                el('span', { class: 'mono' }, call.functionName),
-                statusBadge(call.status),
-                el('span', { class: 'mono' }, JSON.stringify(call.params)),
-                Object.keys(call.scopesApplied).length
-                  ? el('span', { class: 'mono' }, JSON.stringify(call.scopesApplied))
-                  : '—',
-                call.rowCount ?? '—',
-                fmt.ms(call.latencyMs),
-              ]))),
+      runEvidencePanel('Thinking process', evidenceRun, calls, {
+        foot: 'Only functions actually used by this answer are shown.',
+      }),
 
-      feedback.calls.some((call) => call.deniedReason || call.errorMessage)
+      calls.some((call) => call.deniedReason || call.errorMessage)
         ? panel('Refusals and errors', {},
             codeBlock(
-              feedback.calls
+              calls
                 .filter((call) => call.deniedReason || call.errorMessage)
                 .map((call) => `${call.functionName}: ${call.deniedReason ?? call.errorMessage}`)
                 .join('\n'),

@@ -227,12 +227,14 @@ export function button(label, { variant = '', size = '', onclick, iconName, disa
  * stylesheet uses to turn each row into a labelled card on a narrow screen.
  */
 export function table(headers, rows) {
+  const label = (head) => typeof head === 'string' ? head : '';
+
   return el('div', { class: 'tablewrap' },
     el('table', {},
       el('thead', {}, el('tr', {}, ...headers.map((head) => el('th', {}, head)))),
       el('tbody', {}, ...rows.map((cells) =>
         el('tr', {}, ...cells.map((cell, index) =>
-          el('td', { 'data-label': headers[index] ?? '' }, cell)))))));
+          el('td', { 'data-label': label(headers[index]) }, cell)))))));
 }
 
 export function field(label, control, hint, { optional = false } = {}) {

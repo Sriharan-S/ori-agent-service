@@ -1,15 +1,13 @@
 /* The playground.
  *
- * A real conversation against the live chat API, from inside the console. It is
- * deliberately not a shortcut around authentication: it calls the same public
- * /v1/chat/stream endpoint any client would, with an issued API key the operator
- * pastes in, as a chosen role. If it works here it works for the caller, because
- * it is the caller's exact path — key, role, scopes and all.
+ * A real conversation against the live agent, from inside the console. The
+ * admin session is the credential here, so operators do not have to paste an
+ * issued application API key into the playground.
  *
- * It streams with fetch() rather than EventSource, because EventSource cannot
- * set the X-Api-Key header. The body is read as a stream and the SSE frames are
- * parsed by hand, which also means the trace channel is available: every step
- * the agent takes is shown next to the answer it produced.
+ * It streams with fetch() rather than EventSource so the request can use the
+ * admin session cookie and a JSON body. The SSE frames are parsed by hand,
+ * which also means the trace channel is available: every step the agent takes
+ * is shown next to the answer it produced.
  */
 
 import {
@@ -19,16 +17,9 @@ import {
 import { setMarkdown } from './markdown.js';
 import { api, appPath, state } from './app.js';
 
-/** Kept per application, in sessionStorage: convenient across view switches, gone when the tab closes. */
-const keyStore = {
-  get: (appId) => { try { return sessionStorage.getItem(`ori-pg-key-${appId}`) || ''; } catch { return ''; } },
-  set: (appId, value) => { try { value ? sessionStorage.setItem(`ori-pg-key-${appId}`, value) : sessionStorage.removeItem(`ori-pg-key-${appId}`); } catch { /* private mode */ } },
-};
-
 export async function playgroundView() {
-  const [{ roles }, { keys }, { application }] = await Promise.all([
+  const [{ roles }, { application }] = await Promise.all([
     api(appPath('/roles')),
-    api(appPath('/keys')),
     api(`/applications/${state.applicationId}`).catch(() => ({ application: null })),
   ]);
 
@@ -47,12 +38,6 @@ export async function playgroundView() {
 
   // ── Configuration column ──────────────────────────────────────────────────
 
-  const apiKey = el('input', {
-    type: 'password',
-    placeholder: 'ori_xxxx.xxxxxxxx',
-    value: keyStore.get(state.applicationId),
-    autocomplete: 'off',
-  });
   const endUserId = textInput('playground-user', { placeholder: 'any stable id' });
   const roleSelect = select(roles.map((r) => r.name), roles[0].name);
   const traceToggle = el('input', { type: 'checkbox' });
@@ -129,12 +114,7 @@ export async function playgroundView() {
   const config = el('div', { class: 'card pg__config' },
     el('div', { class: 'panel__head' }, el('div', { class: 'panel__title' }, el('h3', {}, 'Session'))),
     el('div', { class: 'panel__body' },
-      field('API key', apiKey,
-        keys.length
-          ? `This application has ${keys.length} key(s): ${keys.map((k) => k.prefix).join(', ')}. ` +
-            'Paste the full secret shown when it was issued — the secret is never stored, only the prefix.'
-          : 'No keys issued yet. Issue one on the Applications page with the <code>chat</code> ' +
-            'and <code>trace</code> scopes, then paste it here.'),
+      notice('This playground uses your admin session with chat and trace access.', 'info'),
 
       isJwt
         ? field('End-user JWT', jwtToken,
@@ -151,7 +131,7 @@ export async function playgroundView() {
         traceToggle,
         el('span', {}, el('strong', {}, 'Show the agent\'s steps'),
           el('br'),
-          el('span', { class: 'muted' }, 'Router, plan, function calls and the reflection, as they stream. Needs the trace scope on the key.'))),
+          el('span', { class: 'muted' }, 'Router, plan, function calls and the reflection, as they stream.'))),
     ));
 
   // ── Conversation column ───────────────────────────────────────────────────
@@ -183,6 +163,15 @@ export async function playgroundView() {
     session.turns.length = index;
   };
 
+  const currentIdentity = () => isJwt
+    ? { mode: 'jwt', token: jwtToken.value.trim() }
+    : {
+        mode: 'asserted',
+        id: endUserId.value.trim() || 'playground-user',
+        role: roleSelect.value,
+        scopes: collectScopes(scopeInputs),
+      };
+
   /**
    * Send a message.
    *
@@ -194,9 +183,7 @@ export async function playgroundView() {
     const message = (text ?? input.value).trim();
     if (!message || session.streaming) return;
 
-    const key = apiKey.value.trim();
-    if (!key) { toast('Paste an issued API key first.', 'bad'); apiKey.focus(); return; }
-    keyStore.set(state.applicationId, key);
+    const identity = currentIdentity();
 
     if (session.firstMessage) { transcript.replaceChildren(); session.firstMessage = false; }
     if (text === undefined) input.value = '';
@@ -207,6 +194,7 @@ export async function playgroundView() {
       onRetry: retry,
       onRate: rate,
     });
+    bubbleRef.identity = identity;
     session.turns.push(userTurn, bubbleRef);
     const showTrace = traceToggle.checked;
 
@@ -223,18 +211,10 @@ export async function playgroundView() {
     try {
       await streamChat({
         message,
-        key,
         trace: showTrace,
         conversationId: session.conversationId,
         replaceFromMessageId: replaceFrom?.messageId ?? null,
-        identity: isJwt
-          ? { mode: 'jwt', token: jwtToken.value.trim() }
-          : {
-              mode: 'asserted',
-              id: endUserId.value.trim() || 'playground-user',
-              role: roleSelect.value,
-              scopes: collectScopes(scopeInputs),
-            },
+        identity,
         onEvent: (event) => handleEvent(event, runContext),
       });
     } catch (error) {
@@ -343,32 +323,25 @@ export async function playgroundView() {
   /**
    * Send a rating.
    *
-   * Goes to the chat API with the same key the conversation used, because that
-   * is the endpoint a real host application will call — testing it here is the
-   * point of the playground. Only the identifiers travel; the service reads the
-   * question, the answer and the calls out of its own tables.
+   * Goes through the admin playground API with the same identity the answer
+   * used. Only identifiers travel; the service reads the question, the answer
+   * and the calls out of its own tables.
    */
   const rate = async (turn, rating, comment) => {
-    const key = apiKey.value.trim();
-    if (!key) { toast('Paste an issued API key first.', 'bad'); return; }
+    if (!turn.identity) { toast('This answer cannot be rated.', 'bad'); return; }
 
     try {
-      const response = await fetch('/v1/chat/feedback', {
+      await api(appPath('/playground/feedback'), {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-api-key': key },
-        body: JSON.stringify({
+        body: {
           rating,
           comment,
           runId: turn.runId,
           assistantMessageId: turn.messageId,
           conversationId: session.conversationId,
-        }),
+          identity: turn.identity,
+        },
       });
-
-      if (!response.ok) {
-        const payload = await response.json().catch(() => ({}));
-        throw new Error(payload.message || `Failed (${response.status})`);
-      }
 
       toast(rating === 'up' ? 'Thanks — noted.' : 'Noted. It is in the review queue.', 'ok');
     } catch (error) {
@@ -401,8 +374,8 @@ export async function playgroundView() {
 
   return frag(
     pageHead('Playground',
-      'A real conversation against the live chat API, as a role you choose. It uses the ' +
-      'same endpoint and the same key any client would, so what works here works for them.'),
+      'A real conversation against the live agent, as a role you choose. The admin ' +
+      'session provides chat and trace access for the playground.'),
     el('div', { class: 'pg' }, config, chat),
   );
 }
@@ -410,31 +383,22 @@ export async function playgroundView() {
 // ── Streaming ─────────────────────────────────────────────────────────────────
 
 async function streamChat({
-  message, key, trace, conversationId, replaceFromMessageId, identity, onEvent,
+  message, trace, conversationId, replaceFromMessageId, identity, onEvent,
 }) {
-  const headers = {
-    'content-type': 'application/json',
-    'x-api-key': key,
-  };
   if (identity.mode === 'jwt') {
     if (!identity.token) throw new Error('Paste an end-user JWT for this application.');
-    headers['x-end-user-token'] = identity.token;
-  } else {
-    headers['x-end-user'] = JSON.stringify({
-      id: identity.id,
-      role: identity.role,
-      scopes: identity.scopes,
-    });
   }
 
-  const response = await fetch('/v1/chat/stream', {
+  const response = await fetch(`/admin/api${appPath('/playground/stream')}`, {
     method: 'POST',
-    headers,
+    headers: { 'content-type': 'application/json' },
+    credentials: 'same-origin',
     body: JSON.stringify({
       message,
       trace,
       conversationId: conversationId ?? undefined,
       replaceFromMessageId: replaceFromMessageId ?? undefined,
+      identity,
     }),
   });
 
@@ -442,7 +406,7 @@ async function streamChat({
     const payload = await response.json().catch(() => ({}));
     throw new Error(
       payload.message
-        ? `${payload.message}${response.status === 401 ? ' (check the API key and its scopes)' : ''}`
+        ? payload.message
         : `The chat request failed (${response.status}).`);
   }
 

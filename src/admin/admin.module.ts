@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
+import { OrchestratorModule } from '../orchestrator/orchestrator.module';
 import { KnowledgeModule } from '../knowledge/knowledge.module';
 import { ManagementModule } from '../management/management.module';
 import { AdminAuthService } from './admin-auth.service';
@@ -10,7 +11,7 @@ import { DatabaseInfoService } from './database-info.service';
 import { ObservabilityService } from './observability.service';
 
 @Module({
-  imports: [AuthModule, ManagementModule, KnowledgeModule],
+  imports: [AuthModule, ManagementModule, KnowledgeModule, OrchestratorModule],
   controllers: [AdminController, DashboardController],
   providers: [
     AdminAuthService,

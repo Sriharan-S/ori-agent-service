@@ -21,6 +21,7 @@ const ASSETS: Record<string, { file: string; type: string }> = {
   theme: { file: 'theme.js', type: 'text/javascript; charset=utf-8' },
   app: { file: 'app.js', type: 'text/javascript; charset=utf-8' },
   ui: { file: 'ui.js', type: 'text/javascript; charset=utf-8' },
+  evidence: { file: 'evidence.js', type: 'text/javascript; charset=utf-8' },
   views: { file: 'views.js', type: 'text/javascript; charset=utf-8' },
   setup: { file: 'setup.js', type: 'text/javascript; charset=utf-8' },
   editor: { file: 'function-editor.js', type: 'text/javascript; charset=utf-8' },
@@ -69,6 +70,11 @@ export class DashboardController {
   @Get('admin/ui.js')
   ui(@Res() response: Response): void {
     this.send('ui', response);
+  }
+
+  @Get('admin/evidence.js')
+  evidence(@Res() response: Response): void {
+    this.send('evidence', response);
   }
 
   @Get('admin/views.js')

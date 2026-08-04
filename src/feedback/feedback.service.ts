@@ -31,11 +31,15 @@ export interface FeedbackRecord {
 /** A rated turn with everything needed to work out why it was wrong. */
 export interface FeedbackDetail extends FeedbackRecord {
   run: {
+    runKey: string;
     intent: string | null;
     responseType: string | null;
     status: string;
+    functionsUsed: string[];
     latencyMs: number | null;
     error: string | null;
+    startedAt: Date;
+    completedAt: Date | null;
   } | null;
   calls: Array<{
     functionName: string;
@@ -46,6 +50,7 @@ export interface FeedbackDetail extends FeedbackRecord {
     latencyMs: number;
     deniedReason: string | null;
     errorMessage: string | null;
+    createdAt: Date;
   }>;
   transcript: Array<{ role: string; content: string; createdAt: Date }>;
 }
@@ -232,15 +237,21 @@ export class FeedbackService {
 
     const run = record.runKey
       ? await this.db.one<{
+          run_key: string;
           intent: string | null;
           response_type: string | null;
           status: string;
+          functions_used: string[];
           latency_ms: number | null;
           error: string | null;
+          started_at: Date;
+          completed_at: Date | null;
         }>(
-          `SELECT intent, response_type, status, latency_ms, error
-             FROM ${this.schema}.agent_runs WHERE run_key = $1`,
-          [record.runKey],
+          `SELECT run_key, intent, response_type, status, functions_used,
+                  latency_ms, error, started_at, completed_at
+             FROM ${this.schema}.agent_runs
+            WHERE run_key = $1 AND application_id = $2`,
+          [record.runKey, applicationId],
         )
       : null;
 
@@ -248,11 +259,11 @@ export class FeedbackService {
     const calls = record.runKey
       ? await this.db.query<AuditRow>(
           `SELECT function_name, status, params, scopes_applied, row_count,
-                  latency_ms, denied_reason, error_message
+                  latency_ms, denied_reason, error_message, created_at
              FROM ${this.schema}.agent_audit_log
-            WHERE run_key = $1
+            WHERE run_key = $1 AND application_id = $2
             ORDER BY created_at`,
-          [record.runKey],
+          [record.runKey, applicationId],
         )
       : [];
 
@@ -261,9 +272,11 @@ export class FeedbackService {
           `SELECT m.role, m.content, m.created_at
              FROM ${this.schema}.agent_messages m
              JOIN ${this.schema}.agent_conversations c ON c.id = m.conversation_id
-            WHERE c.conversation_key = $1 AND m.superseded_at IS NULL
+            WHERE c.conversation_key = $1
+              AND c.application_id = $2
+              AND m.superseded_at IS NULL
             ORDER BY m.created_at`,
-          [record.conversationKey],
+          [record.conversationKey, applicationId],
         )
       : [];
 
@@ -271,11 +284,15 @@ export class FeedbackService {
       ...record,
       run: run
         ? {
+            runKey: run.run_key,
             intent: run.intent,
             responseType: run.response_type,
             status: run.status,
+            functionsUsed: run.functions_used ?? [],
             latencyMs: run.latency_ms,
             error: run.error,
+            startedAt: run.started_at,
+            completedAt: run.completed_at,
           }
         : null,
       calls: calls.map((call) => ({
@@ -287,6 +304,7 @@ export class FeedbackService {
         latencyMs: call.latency_ms,
         deniedReason: call.denied_reason,
         errorMessage: call.error_message,
+        createdAt: call.created_at,
       })),
       transcript: transcript.map((turn) => ({
         role: turn.role,
@@ -346,6 +364,7 @@ interface AuditRow {
   latency_ms: number;
   denied_reason: string | null;
   error_message: string | null;
+  created_at: Date;
 }
 
 function toRecord(row: FeedbackRow): FeedbackRecord {

@@ -5,6 +5,7 @@ import {
   Delete,
   Get,
   Inject,
+  Logger,
   NotFoundException,
   Param,
   ParseIntPipe,
@@ -18,12 +19,19 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { randomUUID } from 'node:crypto';
 import type { Request, Response } from 'express';
 import { DocumentService } from '../knowledge/document.service';
 import { FeedbackService } from '../feedback/feedback.service';
 import { CONFIG, type AppConfig } from '../config/configuration';
+import { EndUserResolverService } from '../auth/end-user-resolver.service';
 import { ApiKeyService } from '../auth/api-key.service';
-import type { ApiKeyScope } from '../auth/identity';
+import type {
+  ApiKeyRecord,
+  ApiKeyScope,
+  EndUser,
+  RequestContext,
+} from '../auth/identity';
 import { RoleService } from '../auth/role.service';
 import { LlmService } from '../llm/llm.service';
 import {
@@ -32,6 +40,8 @@ import {
 } from '../llm/model-registry.service';
 import { defaultPrefixesFor } from '../llm/embedding-prefixes';
 import { ConversationService } from '../memory/conversation.service';
+import { OrchestratorService } from '../orchestrator/orchestrator.service';
+import type { AgentEvent } from '../orchestrator/orchestrator.types';
 import { RegistryService } from '../registry/registry.service';
 import type { FunctionStatus } from '../registry/function.contract';
 import { ApplicationService, type ApplicationInput } from '../management/application.service';
@@ -54,6 +64,7 @@ import {
 import { ObservabilityService } from './observability.service';
 import { DatabaseInfoService } from './database-info.service';
 import { DEMO_FUNCTION_NAME } from '../management/demo-function';
+import type { ChatRequestDto, FeedbackRequestDto } from '../api/dto/chat.dto';
 
 /**
  * Ceiling on an uploaded document.
@@ -72,6 +83,26 @@ interface UploadedDocument {
   mimetype: string;
   size: number;
 }
+
+type PlaygroundIdentity =
+  | {
+      mode: 'asserted';
+      id?: string | null;
+      role?: string | null;
+      scopes?: Record<string, unknown> | null;
+    }
+  | {
+      mode: 'jwt';
+      token?: string | null;
+    };
+
+type PlaygroundChatRequest = ChatRequestDto & {
+  identity?: PlaygroundIdentity | null;
+};
+
+type PlaygroundFeedbackRequest = FeedbackRequestDto & {
+  identity?: PlaygroundIdentity | null;
+};
 
 /**
  * Roles from a multipart field.
@@ -103,6 +134,8 @@ function parseRoles(raw: string | undefined): string[] {
  */
 @Controller('admin/api')
 export class AdminController {
+  private readonly logger = new Logger(AdminController.name);
+
   constructor(
     @Inject(CONFIG) private readonly config: AppConfig,
     private readonly auth: AdminAuthService,
@@ -116,7 +149,9 @@ export class AdminController {
     private readonly models: ModelRegistryService,
     private readonly llm: LlmService,
     private readonly apiKeys: ApiKeyService,
+    private readonly endUsers: EndUserResolverService,
     private readonly conversations: ConversationService,
+    private readonly orchestrator: OrchestratorService,
     private readonly documents: DocumentService,
     private readonly feedback: FeedbackService,
   ) {}
@@ -724,6 +759,111 @@ export class AdminController {
     };
   }
 
+  // ── Playground ─────────────────────────────────────────────────────────────
+
+  /**
+   * Dashboard-only chat stream.
+   *
+   * The public chat API is deliberately API-key authenticated. Inside the
+   * operator console, the admin session is the credential instead, so the
+   * playground can be used without pasting an issued key back into the browser.
+   * The request still goes through the same orchestrator and records the same
+   * run, conversation, audit and feedback evidence as a public chat call.
+   */
+  @Post('applications/:id/playground/stream')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async playgroundStream(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() body: PlaygroundChatRequest,
+    @Req() request: Request,
+    @Res() response: Response,
+  ): Promise<void> {
+    const chat = normaliseChat(body);
+    const context = await this.playgroundContext(id, body.identity ?? null, request);
+
+    response.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no',
+      'x-request-id': context.requestId,
+    });
+    response.flushHeaders();
+
+    const includeTrace = chat.trace === true;
+    let open = true;
+
+    const heartbeat = setInterval(() => {
+      if (open) response.write(': keep-alive\n\n');
+    }, 15_000);
+
+    const send = (event: AgentEvent): void => {
+      if (!open) return;
+      if (event.channel === 'trace' && !includeTrace) return;
+
+      response.write(`event: ${event.type}\n`);
+      response.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+
+    response.on('close', () => {
+      open = false;
+      clearInterval(heartbeat);
+    });
+
+    try {
+      await this.orchestrator.handle(
+        chat.message,
+        chat.conversationId,
+        context,
+        send,
+        { replaceFromMessageId: chat.replaceFromMessageId },
+      );
+    } catch (error) {
+      this.logger.error(
+        `[${context.runId}] admin playground stream failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      send({
+        type: 'error',
+        channel: 'user',
+        message: 'Something went wrong while answering.',
+      });
+    } finally {
+      clearInterval(heartbeat);
+      if (open) {
+        response.write('event: done\ndata: {}\n\n');
+        response.end();
+      }
+      open = false;
+    }
+  }
+
+  @Post('applications/:id/playground/feedback')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async playgroundFeedback(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() body: PlaygroundFeedbackRequest,
+    @Req() request: Request,
+  ): Promise<{ id: number; rating: string }> {
+    if (body.rating !== 'up' && body.rating !== 'down') {
+      throw new BadRequestException('rating must be "up" or "down".');
+    }
+
+    const context = await this.playgroundContext(id, body.identity ?? null, request);
+    const record = await this.feedback.record(context, {
+      rating: body.rating,
+      conversationId: body.conversationId ?? null,
+      runId: body.runId ?? null,
+      messageId: body.assistantMessageId ?? null,
+      comment: body.comment ?? null,
+    });
+
+    return { id: record.id, rating: record.rating };
+  }
+
   // ── Roles ──────────────────────────────────────────────────────────────────
 
   @Get('applications/:id/roles')
@@ -857,6 +997,29 @@ export class AdminController {
     };
   }
 
+  @Get('applications/:id/conversations/:key')
+  @UseGuards(AdminSessionGuard)
+  async conversationDetail(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('key') key: string,
+  ) {
+    const detail = await this.conversations.getDetail(id, key);
+    if (!detail) throw new NotFoundException('No such conversation.');
+    return detail;
+  }
+
+  @Delete('applications/:id/conversations/:key')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async deleteConversation(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('key') key: string,
+  ) {
+    const ok = await this.conversations.remove(id, key);
+    if (!ok) throw new NotFoundException('No such conversation.');
+    return { deleted: true };
+  }
+
   @Get('conversations/:key')
   @UseGuards(AdminSessionGuard)
   async transcript(@Param('key') key: string) {
@@ -899,4 +1062,122 @@ export class AdminController {
     await this.auth.setPassword(id, body.password);
     return { ok: true };
   }
+
+  private async playgroundContext(
+    applicationId: number,
+    identity: PlaygroundIdentity | null,
+    request: Request,
+  ): Promise<RequestContext> {
+    const application = await this.applications.get(applicationId);
+    if (!application.isActive) {
+      throw new BadRequestException('This application is disabled.');
+    }
+
+    let endUser: EndUser;
+
+    if (application.endUserAuth === 'jwt') {
+      if (!identity || identity.mode !== 'jwt') {
+        throw new BadRequestException('Paste an end-user JWT for this application.');
+      }
+      endUser = await this.endUsers.resolve(application, {
+        endUserToken: identity.token ?? undefined,
+      });
+    } else {
+      if (!identity || identity.mode !== 'asserted') {
+        throw new BadRequestException('Choose a role for this playground run.');
+      }
+
+      const roleName = typeof identity.role === 'string' ? identity.role.trim() : '';
+      if (!roleName) throw new BadRequestException('Choose a role for this playground run.');
+
+      endUser = {
+        id:
+          typeof identity.id === 'string' && identity.id.trim()
+            ? identity.id.trim()
+            : 'playground-user',
+        role: roleName,
+        scopes: cleanScopes(identity.scopes),
+      };
+    }
+
+    const role = await this.roles.require(application.id, endUser.role);
+
+    const apiKey: ApiKeyRecord = {
+      id: 0,
+      applicationId: application.id,
+      name: 'admin playground',
+      prefix: 'admin-console',
+      scopes: ['chat', 'manage', 'trace'],
+    };
+
+    return {
+      application,
+      apiKey,
+      endUser,
+      role,
+      runId: randomUUID(),
+      requestId: requestIdFrom(request),
+      traceEnabled: true,
+    };
+  }
+}
+
+function normaliseChat(body: PlaygroundChatRequest): {
+  message: string;
+  conversationId: string | null;
+  replaceFromMessageId: number | null;
+  trace: boolean;
+} {
+  const message = typeof body.message === 'string' ? body.message.trim() : '';
+  if (!message) throw new BadRequestException('message is required.');
+  if (message.length > 4000) {
+    throw new BadRequestException('message must be at most 4000 characters.');
+  }
+
+  const conversationId =
+    typeof body.conversationId === 'string' && body.conversationId.trim()
+      ? body.conversationId.trim()
+      : null;
+
+  let replaceFromMessageId: number | null = null;
+  if (body.replaceFromMessageId !== undefined && body.replaceFromMessageId !== null) {
+    const value = Number(body.replaceFromMessageId);
+    if (!Number.isInteger(value) || value < 1) {
+      throw new BadRequestException('replaceFromMessageId must be a positive integer.');
+    }
+    replaceFromMessageId = value;
+  }
+
+  return {
+    message,
+    conversationId,
+    replaceFromMessageId,
+    trace: body.trace === true,
+  };
+}
+
+function cleanScopes(input: Record<string, unknown> | null | undefined): Record<string, string | number> {
+  const scopes: Record<string, string | number> = {};
+
+  for (const [key, value] of Object.entries(input ?? {})) {
+    const trimmedKey = key.trim();
+    if (!trimmedKey) continue;
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed) scopes[trimmedKey] = trimmed;
+      continue;
+    }
+
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      scopes[trimmedKey] = value;
+    }
+  }
+
+  return scopes;
+}
+
+function requestIdFrom(request: Request): string {
+  const value = (request as Request & { requestId?: unknown }).requestId;
+  return typeof value === 'string' && value.trim() ? value.trim() : randomUUID();
 }

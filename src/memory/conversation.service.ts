@@ -29,6 +29,38 @@ export interface ConversationSummary {
   updatedAt: Date;
 }
 
+export interface ConversationMessage extends ConversationTurn {
+  id: number;
+  createdAt: Date;
+  metadata: unknown;
+  supersededAt: Date | null;
+}
+
+export interface ConversationRun {
+  runKey: string;
+  intent: string | null;
+  status: string;
+  responseType: string | null;
+  functionsUsed: string[];
+  latencyMs: number | null;
+  error: string | null;
+  startedAt: Date;
+  completedAt: Date | null;
+  calls: ConversationRunCall[];
+}
+
+export interface ConversationRunCall {
+  functionName: string;
+  status: string;
+  params: Record<string, unknown>;
+  scopesApplied: Record<string, unknown>;
+  rowCount: number | null;
+  latencyMs: number;
+  deniedReason: string | null;
+  errorMessage: string | null;
+  createdAt: Date;
+}
+
 /** A clarification the user never answered stops being relevant. */
 const PENDING_TTL_MS = 15 * 60 * 1000;
 const HISTORY_TURNS = 8;
@@ -287,16 +319,8 @@ export class ConversationService {
    */
   async getTranscript(
     conversationKey: string,
-  ): Promise<
-    Array<
-      ConversationTurn & {
-        id: number;
-        createdAt: Date;
-        metadata: unknown;
-        supersededAt: Date | null;
-      }
-    >
-  > {
+    applicationId?: number,
+  ): Promise<ConversationMessage[]> {
     const rows = await this.db.query<{
       id: string | number;
       role: string;
@@ -309,8 +333,9 @@ export class ConversationService {
          FROM ${this.schema}.agent_messages m
          JOIN ${this.schema}.agent_conversations c ON c.id = m.conversation_id
         WHERE c.conversation_key = $1
+          AND ($2::bigint IS NULL OR c.application_id = $2)
         ORDER BY m.created_at, m.id`,
-      [conversationKey],
+      [conversationKey, applicationId ?? null],
     );
 
     return rows.map((row) => ({
@@ -321,5 +346,102 @@ export class ConversationService {
       createdAt: row.created_at,
       supersededAt: row.superseded_at,
     }));
+  }
+
+  async getDetail(
+    applicationId: number,
+    conversationKey: string,
+  ): Promise<{ messages: ConversationMessage[]; runs: ConversationRun[] } | null> {
+    const exists = await this.db.one<{ id: string }>(
+      `SELECT id FROM ${this.schema}.agent_conversations
+        WHERE application_id = $1 AND conversation_key = $2`,
+      [applicationId, conversationKey],
+    );
+    if (!exists) return null;
+
+    const [messages, runRows, callRows] = await Promise.all([
+      this.getTranscript(conversationKey, applicationId),
+      this.db.query<{
+        run_key: string;
+        intent: string | null;
+        status: string;
+        response_type: string | null;
+        functions_used: string[];
+        latency_ms: number | null;
+        error: string | null;
+        started_at: Date;
+        completed_at: Date | null;
+      }>(
+        `SELECT run_key, intent, status, response_type, functions_used,
+                latency_ms, error, started_at, completed_at
+           FROM ${this.schema}.agent_runs
+          WHERE application_id = $1 AND conversation_key = $2
+          ORDER BY started_at, id`,
+        [applicationId, conversationKey],
+      ),
+      this.db.query<{
+        run_key: string;
+        function_name: string;
+        status: string;
+        params: Record<string, unknown> | null;
+        scopes_applied: Record<string, unknown> | null;
+        row_count: number | null;
+        latency_ms: number;
+        denied_reason: string | null;
+        error_message: string | null;
+        created_at: Date;
+      }>(
+        `SELECT run_key, function_name, status, params, scopes_applied,
+                row_count, latency_ms, denied_reason, error_message, created_at
+           FROM ${this.schema}.agent_audit_log
+          WHERE application_id = $1 AND conversation_key = $2
+          ORDER BY created_at, id`,
+        [applicationId, conversationKey],
+      ),
+    ]);
+
+    const callsByRun = new Map<string, ConversationRunCall[]>();
+    for (const call of callRows) {
+      const bucket = callsByRun.get(call.run_key) ?? [];
+      bucket.push({
+        functionName: call.function_name,
+        status: call.status,
+        params: call.params ?? {},
+        scopesApplied: call.scopes_applied ?? {},
+        rowCount: call.row_count,
+        latencyMs: call.latency_ms,
+        deniedReason: call.denied_reason,
+        errorMessage: call.error_message,
+        createdAt: call.created_at,
+      });
+      callsByRun.set(call.run_key, bucket);
+    }
+
+    return {
+      messages,
+      runs: runRows.map((run) => ({
+        runKey: run.run_key,
+        intent: run.intent,
+        status: run.status,
+        responseType: run.response_type,
+        functionsUsed: run.functions_used ?? [],
+        latencyMs: run.latency_ms,
+        error: run.error,
+        startedAt: run.started_at,
+        completedAt: run.completed_at,
+        calls: callsByRun.get(run.run_key) ?? [],
+      })),
+    };
+  }
+
+  async remove(applicationId: number, conversationKey: string): Promise<boolean> {
+    const rows = await this.db.query<{ id: string }>(
+      `DELETE FROM ${this.schema}.agent_conversations
+        WHERE application_id = $1 AND conversation_key = $2
+        RETURNING id`,
+      [applicationId, conversationKey],
+    );
+
+    return rows.length > 0;
   }
 }
