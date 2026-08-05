@@ -8,6 +8,7 @@ import {
   formatSources,
 } from '../knowledge/knowledge-prompt';
 import type { Passage } from '../knowledge/retrieval.service';
+import { ResponsePolicyService } from '../policy/response-policy.service';
 import type { AgentEventSink, CallOutcome } from './orchestrator.types';
 import { presentRecord, presentRecords } from './evidence';
 import {
@@ -32,7 +33,10 @@ import {
 export class SynthesizerService {
   private readonly logger = new Logger(SynthesizerService.name);
 
-  constructor(private readonly llm: LlmService) {}
+  constructor(
+    private readonly llm: LlmService,
+    private readonly policy: ResponsePolicyService,
+  ) {}
 
   async answer(
     question: string,
@@ -60,11 +64,15 @@ export class SynthesizerService {
       return message;
     }
 
+    // The same policy the reasoning half was given. A writer that has not been
+    // told what it may cover softens answers the operator explicitly allowed.
+    const policy = await this.policy.compilePrompt(applicationId);
+
     const messages: ChatMessage[] = [
       {
         role: 'system',
         content: `${ORI_SYNTHESIZER_PERSONA}
-
+${policy}
 ═══ WHAT THE USER ASKED ═══
 ${question}
 ${formatHistory(history)}
@@ -173,6 +181,7 @@ ${formatReference(passages)}`,
       {
         role: 'system',
         content: `${ORI_KNOWLEDGE_PERSONA}
+${await this.policy.compilePrompt(applicationId)}
 ${formatHistory(history)}
 ═══ WHAT THE DOCUMENTATION SAYS ═══
 ${formatSources(passages)}`,
@@ -222,7 +231,7 @@ ${formatSources(passages)}`,
       {
         role: 'system',
         content: `${ORI_CONVERSATIONAL_PERSONA}
-
+${await this.policy.compilePrompt(applicationId)}
 ═══ WHAT YOU CAN ACTUALLY DO (describe only these) ═══
 ${capabilities.map((line) => `- ${line}`).join('\n') || '- Nothing is configured yet.'}
 ${formatReference(passages)}

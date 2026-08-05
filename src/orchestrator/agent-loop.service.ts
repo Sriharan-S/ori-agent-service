@@ -5,6 +5,7 @@ import { LlmError, type ChatMessage, type ToolCall } from '../llm/llm.types';
 import type { PlannerFacingFunction } from '../registry/function.contract';
 import { ExecutorService } from './executor.service';
 import { describeObservation } from './observation';
+import { ResponsePolicyService } from '../policy/response-policy.service';
 import { ORI_LOOP_PERSONA } from './ori-persona';
 import { toToolSchema } from './tool-schema';
 import type {
@@ -71,6 +72,7 @@ export class AgentLoopService {
     @Inject(CONFIG) private readonly config: AppConfig,
     private readonly llm: LlmService,
     private readonly executor: ExecutorService,
+    private readonly policy: ResponsePolicyService,
   ) {}
 
   async run(
@@ -86,7 +88,7 @@ export class AgentLoopService {
     const tools = catalogue.map(toToolSchema);
     const valid = new Set(catalogue.map((entry) => entry.name));
     const messages: ChatMessage[] = [
-      { role: 'system', content: this.systemPrompt(run, knowledge) },
+      { role: 'system', content: await this.systemPrompt(run, knowledge) },
       ...toHistory(run.history),
       { role: 'user', content: run.message },
     ];
@@ -265,8 +267,17 @@ export class AgentLoopService {
     return describeObservation(outcome);
   }
 
-  private systemPrompt(run: AgentRun, knowledge: string): string {
+  private async systemPrompt(
+    run: AgentRun,
+    knowledge: string,
+  ): Promise<string> {
+    // The operator's policy sits with the persona rather than in the work
+    // instructions below: it is who this assistant is for this deployment, not
+    // a step in the procedure.
+    const policy = await this.policy.compilePrompt(run.context.application.id);
+
     return `${ORI_LOOP_PERSONA}
+${policy}
 
 ═══ CALLER ═══
 Role: ${run.context.role.name}

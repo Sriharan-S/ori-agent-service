@@ -44,6 +44,7 @@ const SECTIONS = [
   {
     group: 'Reference',
     items: [
+      { id: 'api-routes', title: 'API routes' },
       { id: 'security', title: 'Why it is safe' },
       { id: 'database', title: 'The database it uses' },
       { id: 'troubleshooting', title: 'Troubleshooting' },
@@ -119,6 +120,8 @@ const b = (text) => el('strong', {}, text);
 
 const goto = (label, hash) =>
   button(label, { size: 'sm', onclick: () => navigate(hash) });
+
+const route = (method, path, purpose) => [code(method), code(path), purpose];
 
 const ARTICLES = {
   // ── Start here ────────────────────────────────────────────────────────────
@@ -510,6 +513,150 @@ const ARTICLES = {
   ),
 
   // ── Reference ─────────────────────────────────────────────────────────────
+
+  apiRoutes: () => frag(
+    h3('api-routes', 'API routes'),
+    p('The full OpenAPI reference is generated from the Nest routes and served at ',
+      el('a', { href: '/docs', target: '_blank', rel: 'noopener' }, '/docs'),
+      '. This page is the quick map for operators.'),
+    notice(
+      'The console shell and its files under /admin, such as /admin/app.js and ' +
+      '/admin/styles.css, are static assets. They are intentionally omitted here and in Swagger.',
+      'info'),
+
+    h4('Health'),
+    table(['Method', 'Route', 'Purpose'], [
+      route('GET', '/health', 'Process liveness. This never touches a dependency.'),
+      route('GET', '/ready', 'Database readiness, registry counts and enabled model count.'),
+    ]),
+
+    h4('Chat API'),
+    p('These routes use an application API key. Chat calls also carry an end-user identity.'),
+    table(['Method', 'Route', 'Purpose'], [
+      route('POST', '/v1/chat', 'Run the agent and return the finished response.'),
+      route('POST', '/v1/chat/stream', 'Run the same agent path as Server-Sent Events.'),
+      route('POST', '/v1/chat/feedback', 'Record a thumbs up or down for one answer.'),
+    ]),
+
+    h4('Management API'),
+    p('These routes use an application API key with the ', code('manage'),
+      ' scope and are scoped to that key\'s application.'),
+    table(['Method', 'Route', 'Purpose'], [
+      route('GET', '/v1/manage/functions', 'List functions, optionally by status.'),
+      route('GET', '/v1/manage/functions/{name}', 'Fetch one function, including drafts.'),
+      route('POST', '/v1/manage/functions/check', 'Validate a function without saving.'),
+      route('POST', '/v1/manage/functions', 'Create a draft function.'),
+      route('PUT', '/v1/manage/functions/{name}', 'Update a function and return it to draft.'),
+      route('POST', '/v1/manage/functions/{name}/status', 'Promote, disable or retire a function.'),
+      route('GET', '/v1/manage/functions/{name}/versions', 'Read function version history.'),
+      route('DELETE', '/v1/manage/functions/{name}', 'Delete a function.'),
+      route('GET', '/v1/manage/roles', 'List roles.'),
+      route('PUT', '/v1/manage/roles/{name}', 'Create or update a role.'),
+      route('DELETE', '/v1/manage/roles/{name}', 'Delete a role.'),
+      route('GET', '/v1/manage/services', 'List registered HTTP action targets.'),
+      route('PUT', '/v1/manage/services/{name}', 'Register an HTTP action target.'),
+      route('DELETE', '/v1/manage/services/{name}', 'Remove an HTTP action target.'),
+      route('GET', '/v1/manage/conversations', 'List conversations.'),
+      route('GET', '/v1/manage/conversations/{key}', 'Fetch a conversation transcript.'),
+    ]),
+
+    h4('Setup API'),
+    p('These are unauthenticated because they exist before the first operator can log in. ',
+      'Creating the first account is refused as soon as one already exists.'),
+    table(['Method', 'Route', 'Purpose'], [
+      route('GET', '/admin/api/setup', 'Read setup status and stage.'),
+      route('POST', '/admin/api/setup/check', 'Reconnect and refresh setup status.'),
+      route('GET', '/admin/api/setup/sql', 'Return the DDL needed for manual setup.'),
+      route('POST', '/admin/api/setup/admin', 'Create the first operator account.'),
+    ]),
+
+    h4('Console session'),
+    p('These routes are used by the in-app console. Except for login and setup, they use ',
+      'the ', code('ori_admin_session'), ' cookie. Mutating routes require the admin or ',
+      'owner role where the controller marks that requirement.'),
+    table(['Method', 'Route', 'Purpose'], [
+      route('POST', '/admin/api/login', 'Start an operator session and set the cookie.'),
+      route('POST', '/admin/api/logout', 'End the current operator session.'),
+      route('GET', '/admin/api/me', 'Read the current operator.'),
+    ]),
+
+    h4('Console observability and database'),
+    table(['Method', 'Route', 'Purpose'], [
+      route('GET', '/admin/api/overview', 'Dashboard overview, active runs and recent runs.'),
+      route('GET', '/admin/api/runs/{runKey}', 'One run, including its recorded steps.'),
+      route('GET', '/admin/api/audit', 'Audit log entries.'),
+      route('GET', '/admin/api/database', 'Database connection and privilege report.'),
+      route('GET', '/admin/api/database/tables', 'Service-owned table names.'),
+    ]),
+
+    h4('Console applications, services and keys'),
+    table(['Method', 'Route', 'Purpose'], [
+      route('GET', '/admin/api/applications', 'List applications.'),
+      route('POST', '/admin/api/applications', 'Create an application and install the demo function.'),
+      route('PUT', '/admin/api/applications/{id}', 'Update an application.'),
+      route('POST', '/admin/api/applications/{id}/functions/demo', 'Reinstall the demo function if it was deleted.'),
+      route('GET', '/admin/api/applications/{id}/services', 'List registered HTTP action targets.'),
+      route('PUT', '/admin/api/applications/{id}/services/{name}', 'Create or update an HTTP action target.'),
+      route('DELETE', '/admin/api/applications/{id}/services/{name}', 'Delete an HTTP action target.'),
+      route('GET', '/admin/api/applications/{id}/keys', 'List issued API keys.'),
+      route('POST', '/admin/api/applications/{id}/keys', 'Issue an API key. The secret is returned once.'),
+      route('DELETE', '/admin/api/keys/{id}', 'Revoke an API key.'),
+    ]),
+
+    h4('Console feedback and knowledge'),
+    table(['Method', 'Route', 'Purpose'], [
+      route('GET', '/admin/api/applications/{id}/feedback', 'List answer feedback and summary counts.'),
+      route('GET', '/admin/api/applications/{id}/feedback/{feedbackId}', 'Read one feedback item with run evidence.'),
+      route('POST', '/admin/api/applications/{id}/feedback/{feedbackId}/reviewed', 'Mark feedback reviewed or open.'),
+      route('DELETE', '/admin/api/applications/{id}/feedback/{feedbackId}', 'Delete feedback.'),
+      route('GET', '/admin/api/applications/{id}/knowledge', 'List knowledge documents and indexing status.'),
+      route('GET', '/admin/api/applications/{id}/knowledge/{documentId}', 'Read one knowledge document.'),
+      route('POST', '/admin/api/applications/{id}/knowledge/text', 'Create a document from pasted text.'),
+      route('POST', '/admin/api/applications/{id}/knowledge/upload', 'Upload a PDF, Word, text, Markdown or CSV document.'),
+      route('PUT', '/admin/api/applications/{id}/knowledge/{documentId}/roles', 'Update document visibility by role.'),
+      route('POST', '/admin/api/applications/{id}/knowledge/{documentId}/reindex', 'Re-chunk and re-embed one document.'),
+      route('POST', '/admin/api/applications/{id}/knowledge/reindex', 'Re-index all documents.'),
+      route('DELETE', '/admin/api/applications/{id}/knowledge/{documentId}', 'Delete a knowledge document.'),
+    ]),
+
+    h4('Console functions, roles and playground'),
+    table(['Method', 'Route', 'Purpose'], [
+      route('GET', '/admin/api/applications/{id}/functions', 'List application functions, optionally by status.'),
+      route('GET', '/admin/api/applications/{id}/functions/export', 'Export all functions as a portable bundle.'),
+      route('POST', '/admin/api/applications/{id}/functions/import', 'Import a bundle as draft functions.'),
+      route('GET', '/admin/api/applications/{id}/functions/{name}', 'Read one function and its versions.'),
+      route('POST', '/admin/api/applications/{id}/functions/check', 'Validate a function without saving.'),
+      route('POST', '/admin/api/applications/{id}/functions/{name}/try', 'Run a draft or live function as a chosen role.'),
+      route('POST', '/admin/api/applications/{id}/functions', 'Create a draft function.'),
+      route('PUT', '/admin/api/applications/{id}/functions/{name}', 'Update a function and return it to draft.'),
+      route('POST', '/admin/api/applications/{id}/functions/{name}/status', 'Promote, disable or retire a function.'),
+      route('DELETE', '/admin/api/applications/{id}/functions/{name}', 'Delete a function.'),
+      route('GET', '/admin/api/applications/{id}/roles', 'List roles.'),
+      route('GET', '/admin/api/applications/{id}/roles/{name}/scope-requirements', 'Show the scope values a role must supply.'),
+      route('PUT', '/admin/api/applications/{id}/roles/{name}', 'Create or update a role.'),
+      route('DELETE', '/admin/api/applications/{id}/roles/{name}', 'Delete a role.'),
+      route('POST', '/admin/api/applications/{id}/playground/stream', 'Run the console playground as an SSE stream.'),
+      route('POST', '/admin/api/applications/{id}/playground/feedback', 'Rate a playground answer.'),
+    ]),
+
+    h4('Console models, conversations and operators'),
+    table(['Method', 'Route', 'Purpose'], [
+      route('GET', '/admin/api/models', 'List model endpoints.'),
+      route('POST', '/admin/api/models', 'Create a model endpoint.'),
+      route('PUT', '/admin/api/models/{id}', 'Update a model endpoint.'),
+      route('DELETE', '/admin/api/models/{id}', 'Delete a model endpoint.'),
+      route('GET', '/admin/api/models/prefix-defaults', 'Read inferred embedding prefixes for a model id.'),
+      route('POST', '/admin/api/models/test', 'Test unsaved model settings.'),
+      route('POST', '/admin/api/models/health', 'Check model reachability for an application.'),
+      route('GET', '/admin/api/applications/{id}/conversations', 'List conversations for an application.'),
+      route('GET', '/admin/api/applications/{id}/conversations/{key}', 'Read one conversation.'),
+      route('DELETE', '/admin/api/applications/{id}/conversations/{key}', 'Delete a conversation.'),
+      route('GET', '/admin/api/conversations/{key}', 'Fetch a raw transcript.'),
+      route('GET', '/admin/api/admins', 'List operator accounts.'),
+      route('POST', '/admin/api/admins', 'Create an operator account.'),
+      route('POST', '/admin/api/admins/{id}/password', 'Set an operator password.'),
+    ]),
+  ),
 
   security: () => frag(
     h3('security', 'Why it is safe'),

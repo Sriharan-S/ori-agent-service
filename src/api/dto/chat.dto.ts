@@ -101,7 +101,7 @@ export class FeedbackRequestDto {
 export interface ChatResponseDto {
   conversationId: string;
   runId: string;
-  type: 'answer' | 'clarification' | 'confirmation' | 'error';
+  type: 'answer' | 'clarification' | 'confirmation' | 'refused' | 'error';
   message: string;
   candidates?: Candidate[];
   functionsUsed: string[];

@@ -123,6 +123,8 @@ function makeLoop(
     } as never,
     llm as never,
     executor as never,
+    // No policy configured: the prompt block is empty and nothing is refused.
+    { compilePrompt: async () => '' } as never,
   );
 }
 

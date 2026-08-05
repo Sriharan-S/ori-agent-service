@@ -43,6 +43,8 @@ import { ConversationService } from '../memory/conversation.service';
 import { OrchestratorService } from '../orchestrator/orchestrator.service';
 import type { AgentEvent } from '../orchestrator/orchestrator.types';
 import { RegistryService } from '../registry/registry.service';
+import { ResponsePolicyService } from '../policy/response-policy.service';
+import type { ResponsePolicyInput } from '../policy/policy.contract';
 import type { FunctionStatus } from '../registry/function.contract';
 import { ApplicationService, type ApplicationInput } from '../management/application.service';
 import {
@@ -146,6 +148,7 @@ export class AdminController {
     private readonly functions: FunctionManagementService,
     private readonly trials: FunctionTrialService,
     private readonly roles: RoleService,
+    private readonly policies: ResponsePolicyService,
     private readonly models: ModelRegistryService,
     private readonly llm: LlmService,
     private readonly apiKeys: ApiKeyService,
@@ -906,6 +909,89 @@ export class AdminController {
   ) {
     await this.roles.remove(id, name);
     return { deleted: true };
+  }
+
+  // ── Response policy ────────────────────────────────────────────────────────
+  //
+  // What the model is allowed to answer, as opposed to what it can reach. Roles
+  // govern the second; nothing governed the first until this.
+
+  @Get('applications/:id/policy')
+  @UseGuards(AdminSessionGuard)
+  async getPolicy(@Param('id', ParseIntPipe) id: number) {
+    return { policy: await this.policies.get(id) };
+  }
+
+  /**
+   * The compiled prompt block, exactly as the model will receive it.
+   *
+   * A policy that reads well as a form and badly as a prompt is the failure
+   * mode here, and it is invisible without this.
+   */
+  @Get('applications/:id/policy/preview')
+  @UseGuards(AdminSessionGuard)
+  async previewPolicy(@Param('id', ParseIntPipe) id: number) {
+    return { prompt: await this.policies.compilePrompt(id) };
+  }
+
+  /** Try a message against the deny rules without sending it anywhere. */
+  @Post('applications/:id/policy/check')
+  @UseGuards(AdminSessionGuard)
+  async checkPolicy(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() body: { message?: string },
+  ) {
+    const message = String(body?.message ?? '').trim();
+    if (!message) throw new BadRequestException('Give a message to check.');
+    return { verdict: await this.policies.evaluate(id, message) };
+  }
+
+  @Put('applications/:id/policy')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async upsertPolicy(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() body: ResponsePolicyInput,
+    @CurrentAdmin() admin: { id: number },
+  ) {
+    return { policy: await this.policies.upsert(id, body ?? {}, admin.id) };
+  }
+
+  @Delete('applications/:id/policy')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async deletePolicy(@Param('id', ParseIntPipe) id: number) {
+    await this.policies.remove(id);
+    return { deleted: true };
+  }
+
+  @Get('applications/:id/policy/export')
+  @UseGuards(AdminSessionGuard)
+  async exportPolicy(@Param('id', ParseIntPipe) id: number) {
+    const application = (await this.applications.list()).find(
+      (entry) => entry.id === id,
+    );
+    return this.policies.exportBundle(id, application?.slug, application?.name);
+  }
+
+  /**
+   * Import a policy bundle. Disabled on arrival unless `enable` is passed —
+   * a policy written elsewhere should be read here before it refuses anyone.
+   */
+  @Post('applications/:id/policy/import')
+  @UseGuards(AdminSessionGuard)
+  @RequireAdminRole('admin')
+  async importPolicy(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() body: unknown,
+    @Query('enable') enable: string | undefined,
+    @CurrentAdmin() admin: { id: number },
+  ) {
+    return {
+      policy: await this.policies.importBundle(id, body, admin.id, {
+        enable: enable === 'true',
+      }),
+    };
   }
 
   // ── Models ─────────────────────────────────────────────────────────────────

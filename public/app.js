@@ -15,6 +15,7 @@ import { renderSetup } from './setup.js';
 import { views } from './views.js';
 import { functionEditor } from './function-editor.js';
 import { guideView } from './guide.js';
+import { policyView } from './policy.js';
 import { playgroundView } from './playground.js';
 import { knowledgeView } from './knowledge.js';
 import { feedbackView } from './feedback.js';
@@ -74,6 +75,7 @@ const NAV = [
       { id: 'functions', label: 'Functions', icon: 'functions', countKey: 'functions' },
       { id: 'knowledge', label: 'Knowledge', icon: 'guide' },
       { id: 'roles', label: 'Roles', icon: 'roles' },
+      { id: 'policy', label: 'Response policy', icon: 'guide' },
       { id: 'models', label: 'Models', icon: 'models', countKey: 'models' },
       { id: 'applications', label: 'Applications', icon: 'apps' },
     ],
@@ -98,6 +100,7 @@ const TITLES = {
   'function-edit': 'Edit function',
   knowledge: 'Knowledge',
   roles: 'Roles',
+  policy: 'Response policy',
   models: 'Models',
   applications: 'Applications',
   database: 'Database',
@@ -370,6 +373,7 @@ const PAGES = {
   feedback: () => feedbackView(),
   'function-new': () => functionEditor(null),
   'function-edit': (params) => functionEditor(params.name),
+  policy: () => policyView(),
   guide: (params) => guideView(params.section),
 };
 

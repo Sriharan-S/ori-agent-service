@@ -1,5 +1,4 @@
 import { Body, Controller, Get, Post } from '@nestjs/common';
-import { ApiExcludeController } from '@nestjs/swagger';
 import { SetupService } from './setup.service';
 
 /**
@@ -17,10 +16,10 @@ import { SetupService } from './setup.service';
  *   POST /setup/admin  creates the first account, and is refused by a single
  *                      conditional INSERT the moment one exists.
  *
- * Excluded from the OpenAPI document with the rest of `/admin`: these describe
- * one deployment's state, not an API anyone integrates against.
+ * Included in the OpenAPI document so operators can see every JSON route the
+ * service exposes. These describe one deployment's setup state rather than a
+ * host-application integration surface.
  */
-@ApiExcludeController()
 @Controller('admin/api/setup')
 export class SetupController {
   constructor(private readonly setup: SetupService) {}

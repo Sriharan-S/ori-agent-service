@@ -1,0 +1,590 @@
+{
+  "bundle": "ori.function-bundle",
+  "version": 1,
+  "exportedAt": "2026-08-04T13:06:13.288Z",
+  "application": {
+    "slug": "originbi",
+    "name": "OriginBI"
+  },
+  "_notes": [
+    "Report functions for the OriginBI assessment platform. Import after originbi-functions.bundle.json — this bundle replaces find_candidate, list_candidates and my_report with corrected versions and adds the rest.",
+    "Report readiness is derived from the stored report rows, not from assessment_sessions.is_report_ready. That column is false on every row in the database, so anything reading it reports every report as missing.",
+    "Reports live in three places. The main report (levels 1 and 2) is one row per assessment session in assessment_reports, carrying disc_scores, agile_scores, the report number and the download URL. Level 3 (IAT) is a row per attempt in iat_reports, with a bias_map array and a narrative in report_text, ready when status = DONE. Level 4 (Metaphor) is a row per attempt in metaphor_reports, with the report body in markdown. assessment_reports.level3_scores and level4_scores are empty on every row and are not read by anything here.",
+    "An assessment level's id is NOT its level number: level 3 (IAT) is id 5 and level 4 (Metaphor) is id 3. Every level function resolves the id through assessment_levels rather than assuming.",
+    "Every query is dedup-safe: the database has exactly two physical rows per id for sessions, attempts, reports, levels and score bands, with no primary key. DISTINCT ON, COUNT(DISTINCT id) and LATERAL … LIMIT 1 make each function correct whether or not that is fixed.",
+    "A candidate may retake a level. Per-candidate functions return the most recent attempt, not every attempt.",
+    "Levels 1 (DISC) and 2 (ACI) carry a numeric score; levels 3 and 4 are pattern-based and report no mark.",
+    "ADMIN is exempt from corporate_account_id and holds \"*\" for allowed functions, so it picks these up on import. CORPORATE roles need the new names added to their allowed functions list."
+  ],
+  "functions": [
+    {
+      "category": "reports",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id, as returned by find_candidate.",
+          "required": true,
+          "resolvedIdentifier": true,
+          "min": 1
+        }
+      },
+      "name": "candidate_report_status",
+      "description": "Whether one candidate's reports actually exist, checked against the stored report records rather than a status flag. Returns, per assessment session: the report number, whether the main report is generated and downloadable, when it was generated, the behavioural trait code and style it produced, and separately whether the level 3 IAT report and the level 4 Metaphor report exist. Takes a registration id from find_candidate.",
+      "whenToUse": [
+        "is <candidate>'s report ready",
+        "can I see <candidate>'s report",
+        "has the report been generated for this candidate",
+        "does this candidate have an IAT or Metaphor report"
+      ],
+      "whenNotToUse": [
+        "Not for producing a download link — that is generate_candidate_report.",
+        "Not for the scores themselves — use candidate_behavioural_profile, candidate_agile_index, candidate_iat_report or candidate_metaphor_report."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (s.id)\n       r.full_name AS candidate,\n       s.id AS session_id,\n       s.status AS session_status,\n       ar.report_number,\n       (ar.session_id IS NOT NULL) AS main_report_ready,\n       (ar.report_url IS NOT NULL) AS main_report_downloadable,\n       ar.generated_at AS main_report_generated_at,\n       pt.code AS trait_code,\n       pt.blended_style_name AS style,\n       (iat.attempt_id IS NOT NULL) AS iat_report_ready,\n       iat.generated_at AS iat_report_generated_at,\n       (mr.attempt_id IS NOT NULL) AS metaphor_report_ready,\n       mr.generated_at AS metaphor_report_generated_at,\n       CASE\n         WHEN ar.session_id IS NOT NULL THEN 'Report is ready'\n         WHEN s.status = 'COMPLETED' THEN 'Assessment finished, report not generated yet'\n         ELSE 'No report — the assessment is ' || lower(coalesce(s.status, 'not started'))\n       END AS readiness\n  FROM registrations r\n  JOIN assessment_sessions s ON s.registration_id = r.id\n  LEFT JOIN LATERAL (\n       SELECT x.assessment_session_id AS session_id, x.report_number, x.report_url,\n              x.generated_at, x.dominant_trait_id\n         FROM assessment_reports x\n        WHERE x.assessment_session_id = s.id\n        ORDER BY x.generated_at DESC NULLS LAST, x.id DESC\n        LIMIT 1) ar ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.assessment_attempt_id AS attempt_id, x.generated_at\n         FROM iat_reports x\n        WHERE x.assessment_session_id = s.id AND x.status = 'DONE'\n        ORDER BY x.generated_at DESC NULLS LAST, x.id DESC\n        LIMIT 1) iat ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.assessment_attempt_id AS attempt_id, x.generated_at\n         FROM metaphor_reports x\n        WHERE x.assessment_session_id = s.id\n        ORDER BY x.generated_at DESC NULLS LAST, x.id DESC\n        LIMIT 1) mr ON TRUE\n  LEFT JOIN personality_traits pt ON pt.id = ar.dominant_trait_id\n WHERE r.is_deleted IS NOT TRUE\n   AND r.id = {{param:registration_id}}\n   AND {{scope:corporate_account_id}}\n ORDER BY s.id DESC"
+    },
+    {
+      "category": "reports",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {},
+      "name": "report_readiness_summary",
+      "description": "One row of headline counts about reports: how many candidates are registered, how many finished the assessment, how many have a main report generated, how many of those are downloadable, how many have a level 3 IAT report, how many have a level 4 Metaphor report, and how many finished but still have no report. Counted from the stored report records, so it reflects what actually exists.",
+      "whenToUse": [
+        "how many reports are ready",
+        "how many registered and how many completed the assessment",
+        "how many candidates are waiting on a report",
+        "report generation status overall"
+      ],
+      "whenNotToUse": [
+        "Not for a per-candidate answer — that is candidate_report_status.",
+        "Not for a per-program split — that is program_report_breakdown.",
+        "Not for a per-level split — that is level_report_coverage."
+      ],
+      "returns": "single",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH reg AS (\n  SELECT DISTINCT ON (r.id) r.id AS registration_id, s.id AS session_id, s.status\n    FROM registrations r\n    LEFT JOIN assessment_sessions s ON s.registration_id = r.id\n   WHERE r.is_deleted IS NOT TRUE\n     AND {{scope:corporate_account_id}}\n   ORDER BY r.id, s.created_at DESC NULLS LAST, s.id DESC\n)\nSELECT count(*) AS registered_candidates,\n       count(*) FILTER (WHERE reg.status = 'COMPLETED') AS completed_assessment,\n       count(*) FILTER (WHERE EXISTS (\n         SELECT 1 FROM assessment_reports ar WHERE ar.assessment_session_id = reg.session_id)) AS main_report_ready,\n       count(*) FILTER (WHERE EXISTS (\n         SELECT 1 FROM assessment_reports ar\n          WHERE ar.assessment_session_id = reg.session_id AND ar.report_url IS NOT NULL)) AS main_report_downloadable,\n       count(*) FILTER (WHERE EXISTS (\n         SELECT 1 FROM iat_reports i\n          WHERE i.assessment_session_id = reg.session_id AND i.status = 'DONE')) AS iat_report_ready,\n       count(*) FILTER (WHERE EXISTS (\n         SELECT 1 FROM metaphor_reports mr WHERE mr.assessment_session_id = reg.session_id)) AS metaphor_report_ready,\n       count(*) FILTER (WHERE reg.status = 'COMPLETED' AND NOT EXISTS (\n         SELECT 1 FROM assessment_reports ar WHERE ar.assessment_session_id = reg.session_id)) AS completed_but_no_report\n  FROM reg"
+    },
+    {
+      "category": "reports",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {
+        "program": {
+          "type": "string",
+          "description": "Optional program name to narrow to, full or partial — for example \"College Students\".",
+          "maxLength": 80
+        }
+      },
+      "name": "candidates_with_reports",
+      "description": "Every candidate who has a generated report, newest first, as a table: name, registration id, user id, program, report number, whether it is downloadable, their behavioural and agile totals, their trait code and style, and whether the level 3 IAT and level 4 Metaphor reports also exist. Optionally narrowed to one program.",
+      "whenToUse": [
+        "show me the candidates who have reports",
+        "list the reports that are ready",
+        "give me report details for the ones who completed",
+        "which candidates can I download a report for"
+      ],
+      "whenNotToUse": [
+        "Not for one named candidate — use find_candidate then candidate_report_status.",
+        "Not for candidates without a report — that is list_candidates."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH latest AS (\n  SELECT DISTINCT ON (r.id)\n         r.id AS registration_id, r.full_name AS candidate, r.user_id,\n         coalesce(p.name, 'unassigned') AS program, s.id AS session_id,\n         ar.report_number, ar.generated_at, ar.dominant_trait_id,\n         (ar.report_url IS NOT NULL) AS downloadable,\n         (ar.disc_scores->>'total')::numeric AS behavioural_total,\n         (ar.agile_scores->>'total')::numeric AS agile_total\n    FROM assessment_reports ar\n    JOIN assessment_sessions s ON s.id = ar.assessment_session_id\n    JOIN registrations r ON r.id = s.registration_id\n    LEFT JOIN programs p ON p.id = coalesce(s.program_id, r.program_id)\n   WHERE r.is_deleted IS NOT TRUE\n     AND (cast({{param:program}} AS text) IS NULL OR p.name ILIKE '%' || {{param:program}} || '%')\n     AND {{scope:corporate_account_id}}\n   ORDER BY r.id, ar.generated_at DESC NULLS LAST, ar.id DESC\n)\nSELECT l.registration_id, l.candidate, l.user_id, l.program, l.report_number,\n       l.downloadable, l.behavioural_total, l.agile_total,\n       pt.code AS trait_code, pt.blended_style_name AS style,\n       EXISTS (SELECT 1 FROM iat_reports i\n                WHERE i.assessment_session_id = l.session_id AND i.status = 'DONE') AS iat_report_ready,\n       EXISTS (SELECT 1 FROM metaphor_reports mr\n                WHERE mr.assessment_session_id = l.session_id) AS metaphor_report_ready,\n       l.generated_at\n  FROM latest l\n  LEFT JOIN personality_traits pt ON pt.id = l.dominant_trait_id\n ORDER BY l.generated_at DESC NULLS LAST, l.candidate"
+    },
+    {
+      "category": "reports",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {
+        "trait_code": {
+          "type": "string",
+          "description": "Optional two-letter behavioural trait code to narrow to, for example \"DI\", \"CD\" or \"CS\".",
+          "maxLength": 4
+        },
+        "program": {
+          "type": "string",
+          "description": "Optional program name to narrow to, full or partial — for example \"College Students\".",
+          "maxLength": 80
+        }
+      },
+      "name": "behavioural_scores_all",
+      "description": "A score table for every candidate who has completed level 1, the behavioural (DISC) assessment: name, registration id, user id, program, report number, the Dominance / Influence / Steadiness / Compliance breakdown, the total out of the level maximum, the trait code and blended style, the sincerity reading, and when it was completed. Highest total first. Can be narrowed to one trait code or one program. Candidates whose report has not been generated still appear, with a total but no D/I/S/C breakdown.",
+      "whenToUse": [
+        "give me all the scores of students who completed level 1",
+        "export the behavioural exam scores",
+        "DISC scores for everyone",
+        "list level 1 results as a table"
+      ],
+      "whenNotToUse": [
+        "Not for level 2 — that is agile_scores_all.",
+        "Not for one candidate — that is candidate_behavioural_profile.",
+        "Not for a count per trait code — that is trait_code_distribution."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH lvl AS (\n  SELECT DISTINCT ON (id) id, max_score FROM assessment_levels WHERE level_number = 1 ORDER BY id\n), att AS (\n  SELECT DISTINCT ON (a.registration_id)\n         a.id AS attempt_id, a.registration_id, a.assessment_session_id,\n         a.total_score, a.max_score_snapshot, a.sincerity_index, a.sincerity_class,\n         a.dominant_trait_id, a.completed_at, lvl.max_score AS level_max\n    FROM assessment_attempts a\n    JOIN lvl ON lvl.id = a.assessment_level_id\n    JOIN registrations r ON r.id = a.registration_id\n   WHERE r.is_deleted IS NOT TRUE\n     AND a.status = 'COMPLETED'\n     AND {{scope:corporate_account_id}}\n   ORDER BY a.registration_id, a.completed_at DESC NULLS LAST, a.id DESC\n)\nSELECT att.registration_id, r.full_name AS candidate, r.user_id,\n       coalesce(p.name, 'unassigned') AS program,\n       ar.report_number,\n       (ar.disc->>'D')::numeric AS dominance,\n       (ar.disc->>'I')::numeric AS influence,\n       (ar.disc->>'S')::numeric AS steadiness,\n       (ar.disc->>'C')::numeric AS compliance,\n       att.total_score AS total,\n       coalesce(nullif(att.max_score_snapshot, 0), att.level_max) AS out_of,\n       pt.code AS trait_code,\n       pt.blended_style_name AS style,\n       att.sincerity_index AS sincerity,\n       att.sincerity_class,\n       att.completed_at,\n       (ar.report_number IS NOT NULL) AS report_ready\n  FROM att\n  JOIN registrations r ON r.id = att.registration_id\n  LEFT JOIN LATERAL (\n       SELECT x.report_number, x.disc_scores AS disc\n         FROM assessment_reports x\n        WHERE x.assessment_session_id = att.assessment_session_id\n        ORDER BY x.generated_at DESC NULLS LAST, x.id DESC\n        LIMIT 1) ar ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT s2.program_id FROM assessment_sessions s2\n        WHERE s2.id = att.assessment_session_id ORDER BY s2.id LIMIT 1) sp ON TRUE\n  LEFT JOIN programs p ON p.id = coalesce(sp.program_id, r.program_id)\n  LEFT JOIN personality_traits pt ON pt.id = att.dominant_trait_id\n WHERE (cast({{param:trait_code}} AS text) IS NULL OR upper(pt.code) = upper({{param:trait_code}}))\n   AND (cast({{param:program}} AS text) IS NULL OR p.name ILIKE '%' || {{param:program}} || '%')\n ORDER BY att.total_score DESC NULLS LAST, r.full_name"
+    },
+    {
+      "category": "reports",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {
+        "program": {
+          "type": "string",
+          "description": "Optional program name to narrow to, full or partial — for example \"College Students\".",
+          "maxLength": 80
+        }
+      },
+      "name": "agile_scores_all",
+      "description": "A score table for every candidate who has completed level 2, the Agile Compatibility Index: name, registration id, user id, program, report number, the Commitment / Focus / Openness / Respect / Courage breakdown, the total out of the level maximum, the compatibility band that total falls in, the sincerity class, and when it was completed. Highest total first. Can be narrowed to one program.",
+      "whenToUse": [
+        "give me all the level 2 scores",
+        "ACI scores for everyone who completed it",
+        "agile compatibility results as a table"
+      ],
+      "whenNotToUse": [
+        "Not for level 1 — that is behavioural_scores_all.",
+        "Not for one candidate — that is candidate_agile_index."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH lvl AS (\n  SELECT DISTINCT ON (id) id, max_score FROM assessment_levels WHERE level_number = 2 ORDER BY id\n), att AS (\n  SELECT DISTINCT ON (a.registration_id)\n         a.id AS attempt_id, a.registration_id, a.assessment_session_id,\n         a.total_score, a.max_score_snapshot, a.sincerity_class, a.completed_at,\n         lvl.max_score AS level_max\n    FROM assessment_attempts a\n    JOIN lvl ON lvl.id = a.assessment_level_id\n    JOIN registrations r ON r.id = a.registration_id\n   WHERE r.is_deleted IS NOT TRUE\n     AND a.status = 'COMPLETED'\n     AND {{scope:corporate_account_id}}\n   ORDER BY a.registration_id, a.completed_at DESC NULLS LAST, a.id DESC\n)\nSELECT att.registration_id, r.full_name AS candidate, r.user_id,\n       coalesce(p.name, 'unassigned') AS program,\n       ar.report_number,\n       (ar.agile->>'Commitment')::numeric AS commitment,\n       (ar.agile->>'Focus')::numeric AS focus,\n       (ar.agile->>'Openness')::numeric AS openness,\n       (ar.agile->>'Respect')::numeric AS respect,\n       (ar.agile->>'Courage')::numeric AS courage,\n       att.total_score AS total,\n       coalesce(nullif(att.max_score_snapshot, 0), att.level_max) AS out_of,\n       coalesce(b.level_name, 'outside the published band range') AS band,\n       b.compatibility_tag AS band_summary,\n       att.sincerity_class,\n       att.completed_at,\n       (ar.report_number IS NOT NULL) AS report_ready\n  FROM att\n  JOIN registrations r ON r.id = att.registration_id\n  LEFT JOIN LATERAL (\n       SELECT x.report_number, x.agile_scores AS agile\n         FROM assessment_reports x\n        WHERE x.assessment_session_id = att.assessment_session_id\n        ORDER BY x.generated_at DESC NULLS LAST, x.id DESC\n        LIMIT 1) ar ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT s2.program_id FROM assessment_sessions s2\n        WHERE s2.id = att.assessment_session_id ORDER BY s2.id LIMIT 1) sp ON TRUE\n  LEFT JOIN programs p ON p.id = coalesce(sp.program_id, r.program_id)\n  LEFT JOIN LATERAL (\n       SELECT x.level_name, x.compatibility_tag\n         FROM aci_score_bands x\n        WHERE x.is_active AND x.is_deleted IS NOT TRUE\n          AND att.total_score BETWEEN x.min_score AND x.max_score\n        ORDER BY x.display_order, x.id\n        LIMIT 1) b ON TRUE\n WHERE (cast({{param:program}} AS text) IS NULL OR p.name ILIKE '%' || {{param:program}} || '%')\n ORDER BY att.total_score DESC NULLS LAST, r.full_name"
+    },
+    {
+      "category": "reports",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {},
+      "name": "trait_code_distribution",
+      "description": "How many candidates fall into each behavioural trait code — the two-letter DISC blend such as DI, CD, CS — with the style name that code means and each code's share of all reported candidates. Largest group first. Answers \"how many are in the DI trait\".",
+      "whenToUse": [
+        "how many candidates are in the DI trait",
+        "breakdown by trait code",
+        "which personality styles are most common",
+        "distribution of DISC blends"
+      ],
+      "whenNotToUse": [
+        "Not for the names of the candidates in a code — that is candidates_by_trait_code.",
+        "Not for one candidate's style — that is candidate_behavioural_profile."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH latest AS (\n  SELECT DISTINCT ON (r.id) r.id AS registration_id, ar.dominant_trait_id\n    FROM assessment_reports ar\n    JOIN assessment_sessions s ON s.id = ar.assessment_session_id\n    JOIN registrations r ON r.id = s.registration_id\n   WHERE ar.dominant_trait_id IS NOT NULL\n     AND r.is_deleted IS NOT TRUE\n     AND {{scope:corporate_account_id}}\n   ORDER BY r.id, ar.generated_at DESC NULLS LAST, ar.id DESC\n)\nSELECT pt.code AS trait_code,\n       pt.blended_style_name AS style,\n       count(*) AS candidates,\n       round(100.0 * count(*) / nullif(sum(count(*)) OVER (), 0), 1) AS percent_of_reported\n  FROM latest l\n  JOIN personality_traits pt ON pt.id = l.dominant_trait_id\n GROUP BY pt.code, pt.blended_style_name\n ORDER BY candidates DESC, trait_code"
+    },
+    {
+      "category": "reports",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {
+        "trait_code": {
+          "type": "string",
+          "description": "The behavioural trait code, one or two letters — for example \"DI\", \"CD\", \"CS\" or \"C\".",
+          "required": true,
+          "minLength": 1,
+          "maxLength": 4
+        }
+      },
+      "name": "candidates_by_trait_code",
+      "description": "The candidates whose behavioural result is one particular trait code — the two-letter DISC blend such as DI, CD or CS — as a table: name, registration id, user id, program, report number, the style that code means, the D / I / S / C breakdown and the total. Highest total first. Answers \"list the DI trait code students\".",
+      "whenToUse": [
+        "list the students with the DI trait code",
+        "who are the Charismatic Leaders",
+        "show me everyone in the CD trait"
+      ],
+      "whenNotToUse": [
+        "Not for the counts per code — that is trait_code_distribution.",
+        "Not for every code at once — that is behavioural_scores_all."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH latest AS (\n  SELECT DISTINCT ON (r.id)\n         r.id AS registration_id, r.full_name AS candidate, r.user_id,\n         coalesce(p.name, 'unassigned') AS program, ar.report_number,\n         ar.dominant_trait_id,\n         (ar.disc_scores->>'D')::numeric AS dominance,\n         (ar.disc_scores->>'I')::numeric AS influence,\n         (ar.disc_scores->>'S')::numeric AS steadiness,\n         (ar.disc_scores->>'C')::numeric AS compliance,\n         (ar.disc_scores->>'total')::numeric AS total,\n         ar.generated_at\n    FROM assessment_reports ar\n    JOIN assessment_sessions s ON s.id = ar.assessment_session_id\n    JOIN registrations r ON r.id = s.registration_id\n    LEFT JOIN programs p ON p.id = coalesce(s.program_id, r.program_id)\n   WHERE ar.dominant_trait_id IS NOT NULL\n     AND r.is_deleted IS NOT TRUE\n     AND {{scope:corporate_account_id}}\n   ORDER BY r.id, ar.generated_at DESC NULLS LAST, ar.id DESC\n)\nSELECT l.registration_id, l.candidate, l.user_id, l.program, l.report_number,\n       pt.code AS trait_code, pt.blended_style_name AS style,\n       l.dominance, l.influence, l.steadiness, l.compliance, l.total, l.generated_at\n  FROM latest l\n  JOIN personality_traits pt ON pt.id = l.dominant_trait_id\n WHERE upper(pt.code) = upper({{param:trait_code}})\n ORDER BY l.total DESC NULLS LAST, l.candidate"
+    },
+    {
+      "category": "reports",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id, as returned by find_candidate.",
+          "required": true,
+          "resolvedIdentifier": true,
+          "min": 1
+        }
+      },
+      "name": "candidate_iat_report",
+      "description": "One candidate's level 3 IAT report as it is stored: one row per bias area with the pattern strength found, the hesitation gap in milliseconds and the error rate, plus the written narrative of the report. Takes a registration id from find_candidate. Level 3 produces no numeric mark, so none is reported.",
+      "whenToUse": [
+        "show me the IAT report for <candidate>",
+        "what did the level 3 report say",
+        "read the bias report for this candidate"
+      ],
+      "whenNotToUse": [
+        "Not for the raw per-module timing data — that is candidate_iat_patterns.",
+        "Not for level 4 — that is candidate_metaphor_report.",
+        "Not for whether it exists at all — that is candidate_report_status."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (bias.ord)\n       r.full_name AS candidate,\n       i.generated_at,\n       bias.value->>'name' AS bias_area,\n       bias.value->>'pattern' AS pattern_strength,\n       round((bias.value->>'speedGapMs')::numeric) AS hesitation_ms,\n       round((bias.value->>'errorRate')::numeric, 1) AS error_percent,\n       i.report_text AS narrative\n  FROM iat_reports i\n  JOIN registrations r ON r.id = i.registration_id\n  CROSS JOIN LATERAL jsonb_array_elements(coalesce(i.bias_map, '[]'::jsonb)) WITH ORDINALITY AS bias(value, ord)\n WHERE r.is_deleted IS NOT TRUE\n   AND i.status = 'DONE'\n   AND i.registration_id = {{param:registration_id}}\n   AND {{scope:corporate_account_id}}\n ORDER BY bias.ord, i.generated_at DESC NULLS LAST, i.id DESC"
+    },
+    {
+      "category": "reports",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id, as returned by find_candidate.",
+          "required": true,
+          "resolvedIdentifier": true,
+          "min": 1
+        }
+      },
+      "name": "candidate_metaphor_report",
+      "description": "One candidate's level 4 Metaphor report as it is stored: the written report and when it was generated. Takes a registration id from find_candidate. Level 4 produces no numeric mark, so none is reported.",
+      "whenToUse": [
+        "show me the metaphor report for <candidate>",
+        "what did the level 4 report say"
+      ],
+      "whenNotToUse": [
+        "Not for level 3 — that is candidate_iat_report.",
+        "Not for whether it exists at all — that is candidate_report_status."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (mr.assessment_attempt_id)\n       r.full_name AS candidate,\n       mr.generated_at,\n       mr.markdown AS report\n  FROM metaphor_reports mr\n  JOIN registrations r ON r.id = mr.registration_id\n WHERE r.is_deleted IS NOT TRUE\n   AND mr.registration_id = {{param:registration_id}}\n   AND {{scope:corporate_account_id}}\n ORDER BY mr.assessment_attempt_id DESC, mr.generated_at DESC NULLS LAST, mr.id DESC"
+    },
+    {
+      "category": "reports",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {},
+      "name": "level_report_coverage",
+      "description": "For each assessment level in order — level 1 Behavioural, level 2 ACI, level 3 IAT, level 4 Metaphor — how many attempts exist, how many are completed, how many reports have been generated, and which kind of report that level produces. Levels 3 and 4 keep their reports separately from the main report, and each is counted where it is actually stored.",
+      "whenToUse": [
+        "how many reports exist per level",
+        "which levels are missing reports",
+        "level 3 and level 4 report coverage"
+      ],
+      "whenNotToUse": [
+        "Not for where candidates are stuck — that is level_completion_funnel.",
+        "Not for a single overall total — that is report_readiness_summary."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH att AS (\n  SELECT DISTINCT ON (a.id)\n         a.id, a.assessment_level_id, a.status\n    FROM assessment_attempts a\n    JOIN registrations r ON r.id = a.registration_id\n   WHERE r.is_deleted IS NOT TRUE\n     AND {{scope:corporate_account_id}}\n   ORDER BY a.id\n), lvl AS (\n  SELECT DISTINCT ON (id) id, level_number, name, pattern_type, sort_order\n    FROM assessment_levels ORDER BY id\n), generated AS (\n  SELECT 1 AS level_number, count(DISTINCT ar.assessment_session_id) AS n\n    FROM assessment_reports ar\n    JOIN assessment_sessions s ON s.id = ar.assessment_session_id\n    JOIN registrations r ON r.id = s.registration_id\n   WHERE ar.disc_scores IS NOT NULL AND ar.disc_scores <> '{}'::jsonb\n     AND r.is_deleted IS NOT TRUE\n     AND {{scope:corporate_account_id}}\n   UNION ALL\n  SELECT 2, count(DISTINCT ar.assessment_session_id)\n    FROM assessment_reports ar\n    JOIN assessment_sessions s ON s.id = ar.assessment_session_id\n    JOIN registrations r ON r.id = s.registration_id\n   WHERE ar.agile_scores IS NOT NULL AND ar.agile_scores <> '{}'::jsonb\n     AND r.is_deleted IS NOT TRUE\n     AND {{scope:corporate_account_id}}\n   UNION ALL\n  SELECT 3, count(DISTINCT i.id)\n    FROM iat_reports i\n    JOIN registrations r ON r.id = i.registration_id\n   WHERE i.status = 'DONE'\n     AND r.is_deleted IS NOT TRUE\n     AND {{scope:corporate_account_id}}\n   UNION ALL\n  SELECT 4, count(DISTINCT mr.id)\n    FROM metaphor_reports mr\n    JOIN registrations r ON r.id = mr.registration_id\n   WHERE r.is_deleted IS NOT TRUE\n     AND {{scope:corporate_account_id}}\n)\nSELECT lvl.level_number,\n       lvl.name AS level,\n       lvl.pattern_type AS measures,\n       count(DISTINCT att.id) AS attempts,\n       count(DISTINCT att.id) FILTER (WHERE att.status = 'COMPLETED') AS completed,\n       coalesce(max(generated.n), 0) AS reports_generated,\n       CASE lvl.level_number\n         WHEN 3 THEN 'IAT narrative report (iat_reports)'\n         WHEN 4 THEN 'Metaphor narrative report (metaphor_reports)'\n         WHEN 5 THEN 'no report defined for this level'\n         ELSE 'Main assessment report (assessment_reports)'\n       END AS report_kind\n  FROM lvl\n  LEFT JOIN att ON att.assessment_level_id = lvl.id\n  LEFT JOIN generated ON generated.level_number = lvl.level_number\n GROUP BY lvl.level_number, lvl.name, lvl.pattern_type, lvl.sort_order\n ORDER BY lvl.sort_order"
+    },
+    {
+      "category": "reports",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {},
+      "name": "program_report_breakdown",
+      "description": "Registered, completed and report-ready counts for each program — School Students, College Students, Employee, CXO and so on — largest program first. Shows where reports are outstanding.",
+      "whenToUse": [
+        "report readiness by program",
+        "how many college students have reports",
+        "split completions by program"
+      ],
+      "whenNotToUse": [
+        "Not for a per-level split — that is level_report_coverage.",
+        "Not for a single overall total — that is report_readiness_summary."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH latest AS (\n  SELECT DISTINCT ON (r.id)\n         r.id AS registration_id,\n         coalesce(p.name, 'unassigned') AS program,\n         s.id AS session_id, s.status\n    FROM registrations r\n    LEFT JOIN assessment_sessions s ON s.registration_id = r.id\n    LEFT JOIN programs p ON p.id = coalesce(s.program_id, r.program_id)\n   WHERE r.is_deleted IS NOT TRUE\n     AND {{scope:corporate_account_id}}\n   ORDER BY r.id, s.created_at DESC NULLS LAST, s.id DESC\n)\nSELECT latest.program,\n       count(*) AS registered,\n       count(*) FILTER (WHERE latest.status = 'COMPLETED') AS completed,\n       count(*) FILTER (WHERE EXISTS (\n         SELECT 1 FROM assessment_reports ar\n          WHERE ar.assessment_session_id = latest.session_id)) AS report_ready\n  FROM latest\n GROUP BY latest.program\n ORDER BY registered DESC, latest.program"
+    },
+    {
+      "category": "student",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {},
+      "name": "my_report",
+      "description": "For the signed-in student: whether their own reports actually exist, checked against the stored report records. Returns the report number, whether the main report is generated and downloadable, when it was generated, their trait code and style, and separately whether the level 3 IAT report and the level 4 Metaphor report exist. Returns only the caller's own records.",
+      "whenToUse": [
+        "is my report ready",
+        "what is my report number",
+        "can I download my report",
+        "do I have an IAT or metaphor report"
+      ],
+      "whenNotToUse": [
+        "Not for whether the assessment itself is finished — use my_assessment_status.",
+        "Not for producing a download link — that is generate_my_report.",
+        "Only ever returns the caller's own data."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "s.user_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (s.id)\n       s.id AS session_id,\n       s.status AS session_status,\n       coalesce(p.name, 'unassigned') AS program,\n       ar.report_number,\n       (ar.session_id IS NOT NULL) AS main_report_ready,\n       (ar.report_url IS NOT NULL) AS main_report_downloadable,\n       ar.generated_at AS main_report_generated_at,\n       pt.code AS trait_code,\n       pt.blended_style_name AS style,\n       (iat.attempt_id IS NOT NULL) AS iat_report_ready,\n       (mr.attempt_id IS NOT NULL) AS metaphor_report_ready,\n       CASE\n         WHEN ar.session_id IS NOT NULL THEN 'Report is ready'\n         WHEN s.status = 'COMPLETED' THEN 'Assessment finished, report not generated yet'\n         ELSE 'No report — the assessment is ' || lower(coalesce(s.status, 'not started'))\n       END AS readiness\n  FROM assessment_sessions s\n  LEFT JOIN programs p ON p.id = s.program_id\n  LEFT JOIN LATERAL (\n       SELECT x.assessment_session_id AS session_id, x.report_number, x.report_url,\n              x.generated_at, x.dominant_trait_id\n         FROM assessment_reports x\n        WHERE x.assessment_session_id = s.id\n        ORDER BY x.generated_at DESC NULLS LAST, x.id DESC\n        LIMIT 1) ar ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.assessment_attempt_id AS attempt_id\n         FROM iat_reports x\n        WHERE x.assessment_session_id = s.id AND x.status = 'DONE'\n        ORDER BY x.id DESC LIMIT 1) iat ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.assessment_attempt_id AS attempt_id\n         FROM metaphor_reports x\n        WHERE x.assessment_session_id = s.id\n        ORDER BY x.id DESC LIMIT 1) mr ON TRUE\n  LEFT JOIN personality_traits pt ON pt.id = ar.dominant_trait_id\n WHERE {{scope:user_id}}\n ORDER BY s.id DESC"
+    },
+    {
+      "category": "student",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {},
+      "name": "my_iat_report",
+      "description": "For the signed-in student: their own level 3 IAT report as it is stored — one row per bias area with the pattern strength, the hesitation gap in milliseconds and the error rate, plus the written narrative. Level 3 produces no numeric mark, so none is reported.",
+      "whenToUse": [
+        "show me my IAT report",
+        "what did my level 3 report say",
+        "read my bias report"
+      ],
+      "whenNotToUse": [
+        "Not for the raw per-module timing data — that is my_iat_patterns.",
+        "Not for level 4 — that is my_metaphor_report."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "i.user_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (bias.ord)\n       i.generated_at,\n       bias.value->>'name' AS bias_area,\n       bias.value->>'pattern' AS pattern_strength,\n       round((bias.value->>'speedGapMs')::numeric) AS hesitation_ms,\n       round((bias.value->>'errorRate')::numeric, 1) AS error_percent,\n       i.report_text AS narrative\n  FROM iat_reports i\n  CROSS JOIN LATERAL jsonb_array_elements(coalesce(i.bias_map, '[]'::jsonb)) WITH ORDINALITY AS bias(value, ord)\n WHERE i.status = 'DONE'\n   AND {{scope:user_id}}\n ORDER BY bias.ord, i.generated_at DESC NULLS LAST, i.id DESC"
+    },
+    {
+      "category": "student",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {},
+      "name": "my_metaphor_report",
+      "description": "For the signed-in student: their own level 4 Metaphor report as it is stored — the written report and when it was generated. Level 4 produces no numeric mark, so none is reported.",
+      "whenToUse": [
+        "show me my metaphor report",
+        "what did my level 4 report say"
+      ],
+      "whenNotToUse": [
+        "Not for level 3 — that is my_iat_report."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "mr.user_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (mr.assessment_attempt_id)\n       mr.generated_at,\n       mr.markdown AS report\n  FROM metaphor_reports mr\n WHERE {{scope:user_id}}\n ORDER BY mr.assessment_attempt_id DESC, mr.generated_at DESC NULLS LAST, mr.id DESC"
+    },
+    {
+      "category": "corporate",
+      "kind": "read",
+      "requiredOneOf": [
+        [
+          "name",
+          "registration_id"
+        ]
+      ],
+      "ambiguityResolvesTo": "registration_id",
+      "parameters": {
+        "name": {
+          "type": "string",
+          "description": "The candidate's name, full or partial.",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "registration_id": {
+          "type": "integer",
+          "description": "The registration id, if it is already known.",
+          "min": 1
+        }
+      },
+      "name": "find_candidate",
+      "description": "Find one candidate (a registered person) within your company by their name, and return the identifiers other functions need: their registration id, their user id, the program they are on, the status of their latest assessment session, and whether their main, IAT and Metaphor reports have actually been generated. When several people match the name it returns them as choices rather than picking one.",
+      "whenToUse": [
+        "find the candidate called <name>",
+        "look up <name>",
+        "which registration is <name>"
+      ],
+      "whenNotToUse": [
+        "Not for a list of everyone — that is list_candidates.",
+        "Not for a platform user by email — that is find_user."
+      ],
+      "returns": "single-or-ambiguous",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (r.id)\n       r.id AS id,\n       r.full_name AS label,\n       coalesce(p.name, 'no program') || ' · ' || coalesce(s.status, 'no session yet')\n         || ' · ' || CASE WHEN ar.n > 0 THEN 'report ready' ELSE 'no report' END AS detail,\n       CASE\n         WHEN r.id = {{param:registration_id}} THEN 100\n         WHEN lower(r.full_name) = lower({{param:name}}) THEN 100\n         ELSE 70\n       END AS match_score,\n       r.full_name,\n       r.user_id,\n       coalesce(p.name, 'unassigned') AS program,\n       r.status AS registration_status,\n       coalesce(s.status, 'NO_SESSION') AS session_status,\n       (ar.n > 0) AS report_ready,\n       (iat.n > 0) AS iat_report_ready,\n       (mr.n > 0) AS metaphor_report_ready\n  FROM registrations r\n  LEFT JOIN LATERAL (\n       SELECT s2.id, s2.status, s2.program_id\n         FROM assessment_sessions s2\n        WHERE s2.registration_id = r.id\n        ORDER BY s2.created_at DESC NULLS LAST, s2.id DESC\n        LIMIT 1) s ON TRUE\n  LEFT JOIN programs p ON p.id = coalesce(s.program_id, r.program_id)\n  LEFT JOIN LATERAL (\n       SELECT count(DISTINCT x.id) AS n FROM assessment_reports x\n        WHERE x.assessment_session_id = s.id) ar ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT count(DISTINCT x.id) AS n FROM iat_reports x\n        WHERE x.assessment_session_id = s.id AND x.status = 'DONE') iat ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT count(DISTINCT x.id) AS n FROM metaphor_reports x\n        WHERE x.assessment_session_id = s.id) mr ON TRUE\n WHERE r.is_deleted IS NOT TRUE\n   AND (\n        r.full_name ILIKE '%' || {{param:name}} || '%'\n     OR r.id = {{param:registration_id}}\n   )\n   AND {{scope:corporate_account_id}}\n ORDER BY r.id"
+    },
+    {
+      "category": "corporate",
+      "kind": "read",
+      "requiredOneOf": [],
+      "ambiguityResolvesTo": null,
+      "parameters": {
+        "session_status": {
+          "type": "string",
+          "description": "Optional session status to narrow to.",
+          "enum": [
+            "NOT_STARTED",
+            "IN_PROGRESS",
+            "COMPLETED",
+            "EXPIRED",
+            "PARTIALLY_EXPIRED",
+            "NO_SESSION"
+          ]
+        }
+      },
+      "name": "list_candidates",
+      "description": "List the candidates registered under your company, each with their registration id, user id, program, the status of their latest assessment session, and whether their main, IAT and Metaphor reports have actually been generated. Optionally narrowed to one session status.",
+      "whenToUse": [
+        "list our candidates",
+        "who is registered",
+        "show me everyone who has not started"
+      ],
+      "whenNotToUse": [
+        "Not for one named person — that is find_candidate.",
+        "Not for only those with reports — that is candidates_with_reports."
+      ],
+      "returns": "list",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (r.id)\n       r.id,\n       r.full_name,\n       r.user_id,\n       coalesce(p.name, 'unassigned') AS program,\n       coalesce(s.status, 'NO_SESSION') AS session_status,\n       (ar.n > 0) AS report_ready,\n       (iat.n > 0) AS iat_report_ready,\n       (mr.n > 0) AS metaphor_report_ready,\n       r.created_at\n  FROM registrations r\n  LEFT JOIN LATERAL (\n       SELECT s2.id, s2.status, s2.program_id\n         FROM assessment_sessions s2\n        WHERE s2.registration_id = r.id\n        ORDER BY s2.created_at DESC NULLS LAST, s2.id DESC\n        LIMIT 1) s ON TRUE\n  LEFT JOIN programs p ON p.id = coalesce(s.program_id, r.program_id)\n  LEFT JOIN LATERAL (\n       SELECT count(DISTINCT x.id) AS n FROM assessment_reports x\n        WHERE x.assessment_session_id = s.id) ar ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT count(DISTINCT x.id) AS n FROM iat_reports x\n        WHERE x.assessment_session_id = s.id AND x.status = 'DONE') iat ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT count(DISTINCT x.id) AS n FROM metaphor_reports x\n        WHERE x.assessment_session_id = s.id) mr ON TRUE\n WHERE r.is_deleted IS NOT TRUE\n   AND (cast({{param:session_status}} AS text) IS NULL\n        OR coalesce(s.status, 'NO_SESSION') = {{param:session_status}})\n   AND {{scope:corporate_account_id}}\n ORDER BY r.id"
+    }
+  ]
+}

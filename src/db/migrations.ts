@@ -51,6 +51,7 @@ export const AGENT_TABLES = [
   'agent_documents',
   'agent_document_chunks',
   'agent_feedback',
+  'agent_response_policies',
 ] as const;
 
 export function buildMigrations(schema: string): Migration[] {
@@ -640,6 +641,42 @@ export function buildMigrations(schema: string): Migration[] {
         CREATE UNIQUE INDEX IF NOT EXISTS agent_feedback_turn_idx
           ON ${s}.agent_feedback (run_key, message_id)
           WHERE run_key IS NOT NULL AND message_id IS NOT NULL;
+      `,
+    },
+
+    {
+      id: '0014_response_policy',
+      sql: `
+        -- What the model is permitted to answer, per application.
+        --
+        -- One row per application, because a policy is a single document an
+        -- administrator edits and exports, not a collection of records. The
+        -- rules live in JSONB rather than child tables for the same reason:
+        -- they are only ever read and written whole.
+        CREATE TABLE IF NOT EXISTS ${s}.agent_response_policies (
+          id               BIGSERIAL   PRIMARY KEY,
+          application_id   BIGINT      NOT NULL
+                             REFERENCES ${s}.agent_applications(id) ON DELETE CASCADE,
+          -- Off means the prompt additions and the refusal check are both
+          -- skipped, so a policy can be parked without deleting it.
+          is_enabled       BOOLEAN     NOT NULL DEFAULT TRUE,
+          -- Appended to the reasoning and answering prompts verbatim.
+          system_prompt    TEXT        NOT NULL DEFAULT '',
+          -- [{ topic, note }] — subjects the model may address, and how.
+          allow_rules      JSONB       NOT NULL DEFAULT '[]'::jsonb,
+          -- [{ topic, patterns[], message }] — subjects it must refuse. A
+          -- matching pattern refuses before any model or function is reached.
+          deny_rules       JSONB       NOT NULL DEFAULT '[]'::jsonb,
+          -- Used when a deny rule carries no message of its own.
+          refusal_message  TEXT        NOT NULL DEFAULT '',
+          updated_by       BIGINT      REFERENCES ${s}.agent_admin_users(id) ON DELETE SET NULL,
+          created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
+        -- One policy per application. The upsert depends on this.
+        CREATE UNIQUE INDEX IF NOT EXISTS agent_response_policies_app_idx
+          ON ${s}.agent_response_policies (application_id);
       `,
     },
   ];

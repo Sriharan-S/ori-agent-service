@@ -21,6 +21,7 @@ import { LlmModule } from './llm/llm.module';
 import { ManagementModule } from './management/management.module';
 import { MemoryModule } from './memory/memory.module';
 import { OrchestratorModule } from './orchestrator/orchestrator.module';
+import { PolicyModule } from './policy/policy.module';
 import { RegistryModule } from './registry/registry.module';
 import { SetupModule } from './setup/setup.module';
 import { MaintenanceService } from './common/maintenance.service';
@@ -68,6 +69,7 @@ const config = loadConfiguration();
     MemoryModule,
     FeedbackModule,
     RegistryModule,
+    PolicyModule,
     OrchestratorModule,
     ManagementModule,
     AdminModule,

@@ -1,0 +1,632 @@
+{
+  "bundle": "ori.function-bundle",
+  "version": 1,
+  "exportedAt": "2026-08-05T02:37:11.284Z",
+  "application": {
+    "slug": "originbi",
+    "name": "OriginBI"
+  },
+  "_notes": [
+    "Report variants and career guidance for the OriginBI assessment platform.",
+    "Import alongside the existing set — no function here replaces one already live.",
+    "Report variants mirror student-service reportFactory.ts: level1 is College only, CXO has no short variant, and the College short report renders as the MBA variant when the degree, group or report title says MBA.",
+    "The group and placement endpoints only answer JSON for ?json=true, unlike the single-student endpoint. Both action paths carry it.",
+    "Career matching is keyed on the candidate's dominant blended trait AND their department_degree_id. School candidates have no degree, so they match courses (trait_based_course_details) rather than roles (career_roles).",
+    "career_role_guidance and career_role_tools are reference material about a role, not about a person, so all three roles may read them. Nothing tenant-specific reaches them: the career_role_id comes from a match function that is already scope-filtered.",
+    "Every query is dedup-safe against the double-seeded database: DISTINCT ON (id) and COUNT(DISTINCT id) throughout, and reference joins that could fan out (aci_score_bands, department_degrees, groups) go through LATERAL ... LIMIT 1.",
+    "Roles need updating after import: STUDENT gains my_career_profile, my_career_matches, my_course_matches, career_role_guidance, career_role_tools, report_catalogue. CORPORATE gains the rest. ADMIN already holds \"*\".",
+    "generate_placement_handbook here is byte-identical to the copy in originbi-groups-and-profiles.bundle.json, so import order cannot change which definition wins."
+  ],
+  "functions": [
+    {
+      "name": "report_catalogue",
+      "category": "reports",
+      "kind": "read",
+      "description": "The catalogue of assessment report variants this platform produces: for each program (School, College, Employee, CXO) which of the full, short and level1 report types exists, what each one covers, and where a variant is not built. Reference information — it describes the product, not any candidate. Takes no parameters.",
+      "whenToUse": [
+        "what kinds of report can I get",
+        "what is the difference between the full and the short report",
+        "is there a level 1 only report",
+        "what does the MBA report contain"
+      ],
+      "whenNotToUse": [
+        "Not for whether one candidate's report exists — that is candidate_report_status.",
+        "Not for which variants a particular candidate can be given — that is candidate_report_options."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT",
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [],
+      "sqlTemplate": "SELECT v.program, v.report_type, v.what_it_covers, v.availability\n  FROM (VALUES\n    (1, 'School Students', 'full',   'The complete school report: behavioural profile, agile values, course direction and detailed guidance.', 'Available for every school candidate with a generated report.'),\n    (2, 'School Students', 'short',  'The condensed school report. Rendered as SSLC, HSC or IGCSE depending on the candidate''s board and level.', 'Available for every school candidate.'),\n    (3, 'School Students', 'level1', 'Behavioural-only (DISC) short report.', 'Not built for school candidates. College only.'),\n    (4, 'College Students','full',   'The complete college report: behavioural profile, agile values, matched career roles and full guidance.', 'Available for every college candidate with a generated report.'),\n    (5, 'College Students','short',  'The condensed college report. Rendered as the MBA variant when the candidate''s degree, group or report title says MBA.', 'Available for every college candidate.'),\n    (6, 'College Students','level1', 'Behavioural-only (DISC) short report, covering level 1 alone.', 'College candidates only. Useful when only level 1 is finished.'),\n    (7, 'Employee',        'full',   'The complete employee report: behavioural profile, agile values and workplace guidance.', 'Available for every employee candidate with a generated report.'),\n    (8, 'Employee',        'short',  'The condensed employee report.', 'Available for every employee candidate.'),\n    (9, 'Employee',        'level1', 'Behavioural-only (DISC) short report.', 'Not built for employee candidates. College only.'),\n    (10,'CXO General',     'full',   'The complete CXO report: leadership behavioural profile and executive guidance.', 'The only variant built for CXO. Short and level1 are not available.'),\n    (11,'CXO General',     'short',  'The condensed CXO report.', 'Not built for CXO candidates.'),\n    (12,'CXO General',     'level1', 'Behavioural-only (DISC) short report.', 'Not built for CXO candidates.')\n  ) AS v(sort_order, program, report_type, what_it_covers, availability)\n ORDER BY v.sort_order"
+    },
+    {
+      "name": "candidate_report_options",
+      "category": "corporate",
+      "kind": "read",
+      "description": "For one candidate: which report variants can actually be produced for them — whether the full, short and level1 reports each apply to their program, whether their short report renders as the MBA variant, whether a report has already been generated and when. Takes a registration id from find_candidate. Only returns candidates in your own company.",
+      "whenToUse": [
+        "which report can I generate for this candidate",
+        "can I get a level 1 only report for <candidate>",
+        "does <candidate> get the MBA report",
+        "has a report already been made for <candidate>"
+      ],
+      "whenNotToUse": [
+        "Not for whether the report file is ready to download — that is candidate_report_status.",
+        "Not for the product-wide list of report types — that is report_catalogue."
+      ],
+      "parameters": {
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id, as returned by find_candidate. Ask for the candidate by name first if you do not have it.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (r.id)\n       r.full_name AS candidate,\n       r.user_id,\n       coalesce(pr.name, 'unassigned') AS program,\n       CASE WHEN upper(coalesce(dt.name,'') || ' ' || coalesce(d.name,'') || ' ' ||\n                       coalesce(g.name,'') || ' ' || coalesce(pr.report_title,'')) LIKE '%MBA%'\n            THEN TRUE ELSE FALSE END AS short_report_renders_as_mba,\n       r.school_level,\n       TRUE AS full_report_available,\n       CASE WHEN coalesce(pr.name,'') = 'CXO General' THEN FALSE ELSE TRUE END AS short_report_available,\n       CASE WHEN coalesce(pr.name,'') = 'College Students' THEN TRUE ELSE FALSE END AS level1_report_available,\n       (ar.report_number IS NOT NULL) AS already_generated,\n       ar.report_number,\n       ar.generated_at AS last_generated_at,\n       g.id AS group_id,\n       g.name AS group_name,\n       r.department_degree_id\n  FROM registrations r\n  LEFT JOIN LATERAL (\n       SELECT s2.id, s2.program_id FROM assessment_sessions s2\n        WHERE s2.registration_id = r.id\n        ORDER BY s2.created_at DESC NULLS LAST, s2.id DESC LIMIT 1) s ON TRUE\n  LEFT JOIN programs pr ON pr.id = coalesce(s.program_id, r.program_id)\n  LEFT JOIN LATERAL (SELECT x.id, x.name FROM groups x WHERE x.id = r.group_id LIMIT 1) g ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.department_id, x.degree_type_id FROM department_degrees x\n        WHERE x.id = r.department_degree_id LIMIT 1) dd ON TRUE\n  LEFT JOIN LATERAL (SELECT x.name FROM departments x WHERE x.id = dd.department_id LIMIT 1) d ON TRUE\n  LEFT JOIN LATERAL (SELECT x.name FROM degree_types x WHERE x.id = dd.degree_type_id LIMIT 1) dt ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.report_number, x.generated_at FROM assessment_reports x\n        WHERE x.assessment_session_id = s.id\n        ORDER BY x.generated_at DESC NULLS LAST, x.id DESC LIMIT 1) ar ON TRUE\n WHERE r.is_deleted IS NOT TRUE\n   AND r.id = {{param:registration_id}}\n   AND {{scope:corporate_account_id}}\n ORDER BY r.id"
+    },
+    {
+      "name": "find_group",
+      "category": "corporate",
+      "kind": "read",
+      "description": "Find one assessment group (a cohort — a college batch, a department intake, a company intake) by its name, and return its id along with the company it belongs to and how many candidates are registered under it. Use this before any group-wide or placement report, which take a group id rather than a name.",
+      "whenToUse": [
+        "find the KIOT CSE group",
+        "which group is <name>",
+        "how many candidates are in <group>",
+        "look up a cohort by name"
+      ],
+      "whenNotToUse": [
+        "Not for finding a person — that is find_candidate.",
+        "Not for a company account — that is find_corporate_account."
+      ],
+      "parameters": {
+        "name": {
+          "type": "string",
+          "description": "Group or cohort name, full or partial.",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "group_id": {
+          "type": "integer",
+          "description": "Numeric group id, if already known.",
+          "min": 1
+        }
+      },
+      "requiredOneOf": [
+        [
+          "name",
+          "group_id"
+        ]
+      ],
+      "returns": "single-or-ambiguous",
+      "ambiguityResolvesTo": "group_id",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "g.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (g.id)\n       g.id AS id,\n       g.name AS label,\n       coalesce(ca.company_name, 'no company') || ' · ' || cnt.n || ' candidates' AS detail,\n       CASE WHEN g.id = {{param:group_id}} THEN 100\n            WHEN lower(g.name) = lower({{param:name}}) THEN 100\n            ELSE 70 END AS match_score,\n       g.name AS group_name,\n       cnt.n AS candidates,\n       g.is_active\n  FROM groups g\n  LEFT JOIN LATERAL (\n       SELECT count(DISTINCT r.id) AS n FROM registrations r\n        WHERE r.group_id = g.id AND r.is_deleted IS NOT TRUE) cnt ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.company_name FROM corporate_accounts x\n        WHERE x.id = g.corporate_account_id LIMIT 1) ca ON TRUE\n WHERE g.is_deleted IS NOT TRUE\n   AND (g.name ILIKE '%' || {{param:name}} || '%' OR g.id = {{param:group_id}})\n   AND {{scope:corporate_account_id}}\n ORDER BY g.id"
+    },
+    {
+      "name": "find_department_degree",
+      "category": "corporate",
+      "kind": "read",
+      "description": "Find a department-and-degree combination (for example \"B.E Computer Science and Engineering\") by department or degree name, returning its id. Placement handbooks are produced per group and per department-degree, so this resolves the second of those two ids.",
+      "whenToUse": [
+        "find the B.E Computer Science degree",
+        "which department degree id is mechanical engineering",
+        "look up an MBA degree entry"
+      ],
+      "whenNotToUse": [
+        "Not for a cohort — that is find_group.",
+        "Not for a candidate — that is find_candidate."
+      ],
+      "parameters": {
+        "name": {
+          "type": "string",
+          "description": "Department or degree name, full or partial.",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "department_degree_id": {
+          "type": "integer",
+          "description": "Numeric department-degree id, if already known.",
+          "min": 1
+        }
+      },
+      "requiredOneOf": [
+        [
+          "name",
+          "department_degree_id"
+        ]
+      ],
+      "returns": "single-or-ambiguous",
+      "ambiguityResolvesTo": "department_degree_id",
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [],
+      "sqlTemplate": "SELECT DISTINCT ON (dd.id)\n       dd.id AS id,\n       coalesce(dt.name, '') || ' ' || coalesce(d.name, '') AS label,\n       coalesce(dd.course_duration::text || ' year course', 'duration not set') AS detail,\n       CASE WHEN dd.id = {{param:department_degree_id}} THEN 100\n            WHEN lower(coalesce(d.name,'')) = lower({{param:name}}) THEN 100\n            ELSE 70 END AS match_score,\n       d.name AS department,\n       dt.name AS degree\n  FROM department_degrees dd\n  LEFT JOIN departments d ON d.id = dd.department_id\n  LEFT JOIN degree_types dt ON dt.id = dd.degree_type_id\n WHERE dd.is_deleted IS NOT TRUE\n   AND (d.name ILIKE '%' || {{param:name}} || '%'\n        OR dt.name ILIKE '%' || {{param:name}} || '%'\n        OR dd.id = {{param:department_degree_id}})\n ORDER BY dd.id"
+    },
+    {
+      "name": "candidate_career_profile",
+      "category": "career",
+      "kind": "read",
+      "description": "Everything needed to advise one candidate on their career: their behavioural (DISC) breakdown and total, their agile values and band, their blended style with what that style means, their sincerity, and how many matched career roles exist for them. This is the grounding for career guidance — call it before giving any advice, then call candidate_career_matches for the roles themselves. Takes a registration id from find_candidate. Only returns candidates in your own company.",
+      "whenToUse": [
+        "what career should this candidate consider",
+        "give me career advice for <candidate>",
+        "what suits <candidate> based on their scores",
+        "summarise this candidate for a career conversation"
+      ],
+      "whenNotToUse": [
+        "Not for the list of matched roles on its own — that is candidate_career_matches.",
+        "Not for the level 1 breakdown alone — that is candidate_behavioural_profile."
+      ],
+      "parameters": {
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id, as returned by find_candidate.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "single",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (r.id)\n       r.full_name AS candidate,\n       coalesce(pr.name, 'unassigned') AS program,\n       pt.code AS trait_code,\n       pt.blended_style_name AS style,\n       pt.blended_style_desc AS what_the_style_means,\n       (ar.disc_scores->>'D')::numeric AS dominance,\n       (ar.disc_scores->>'I')::numeric AS influence,\n       (ar.disc_scores->>'S')::numeric AS steadiness,\n       (ar.disc_scores->>'C')::numeric AS compliance,\n       (ar.disc_scores->>'total')::numeric AS behavioural_total,\n       (ar.agile_scores->>'Commitment')::numeric AS commitment,\n       (ar.agile_scores->>'Focus')::numeric AS focus,\n       (ar.agile_scores->>'Openness')::numeric AS openness,\n       (ar.agile_scores->>'Respect')::numeric AS respect,\n       (ar.agile_scores->>'Courage')::numeric AS courage,\n       (ar.agile_scores->>'total')::numeric AS agile_total,\n       coalesce(b.level_name, 'not banded') AS agile_band,\n       b.interpretation AS what_the_band_means,\n       ar.overall_sincerity AS sincerity,\n       r.department_degree_id,\n       r.school_level,\n       (SELECT count(DISTINCT cr.id) FROM career_roles cr\n         WHERE cr.trait_id = ar.dominant_trait_id\n           AND cr.department_degree_id = r.department_degree_id\n           AND cr.is_active AND cr.is_deleted IS NOT TRUE) AS career_matches_available,\n       ar.generated_at AS report_generated_at\n  FROM registrations r\n  JOIN assessment_sessions s ON s.registration_id = r.id\n  JOIN LATERAL (\n       SELECT x.disc_scores, x.agile_scores, x.dominant_trait_id,\n              x.overall_sincerity, x.generated_at\n         FROM assessment_reports x WHERE x.assessment_session_id = s.id\n        ORDER BY x.generated_at DESC NULLS LAST, x.id DESC LIMIT 1) ar ON TRUE\n  LEFT JOIN programs pr ON pr.id = coalesce(s.program_id, r.program_id)\n  LEFT JOIN personality_traits pt ON pt.id = ar.dominant_trait_id\n  LEFT JOIN LATERAL (\n       SELECT x.level_name, x.interpretation FROM aci_score_bands x\n        WHERE x.is_active AND x.is_deleted IS NOT TRUE\n          AND (ar.agile_scores->>'total')::numeric BETWEEN x.min_score AND x.max_score\n        ORDER BY x.display_order, x.id LIMIT 1) b ON TRUE\n WHERE r.is_deleted IS NOT TRUE\n   AND r.id = {{param:registration_id}}\n   AND {{scope:corporate_account_id}}\n ORDER BY r.id, s.id DESC"
+    },
+    {
+      "name": "candidate_career_matches",
+      "category": "career",
+      "kind": "read",
+      "description": "The career roles matched to one candidate, drawn from their blended behavioural style and their degree: the role name, what the role is, and how many recommended tools are listed for it. Each row carries a career_role_id that career_role_guidance and career_role_tools take. Takes a registration id from find_candidate. Only returns candidates in your own company.",
+      "whenToUse": [
+        "what roles suit this candidate",
+        "which careers match <candidate>",
+        "show me the career options for this student"
+      ],
+      "whenNotToUse": [
+        "Not for the scores behind the match — that is candidate_career_profile.",
+        "Not for the detailed roadmap of one role — that is career_role_guidance.",
+        "For school candidates with no degree this returns nothing; use candidate_course_matches instead."
+      ],
+      "parameters": {
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id, as returned by find_candidate.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH prof AS (\n  SELECT DISTINCT ON (r.id)\n         r.id AS registration_id, r.department_degree_id, ar.dominant_trait_id\n    FROM registrations r\n    JOIN assessment_sessions s ON s.registration_id = r.id\n    JOIN LATERAL (\n         SELECT x.dominant_trait_id FROM assessment_reports x\n          WHERE x.assessment_session_id = s.id\n          ORDER BY x.generated_at DESC NULLS LAST, x.id DESC LIMIT 1) ar ON TRUE\n   WHERE r.is_deleted IS NOT TRUE\n     AND r.id = {{param:registration_id}}\n     AND {{scope:corporate_account_id}}\n   ORDER BY r.id, s.id DESC\n)\nSELECT DISTINCT ON (cr.id)\n       cr.id AS career_role_id,\n       cr.career_role_name AS career_role,\n       cr.short_description AS what_the_role_is,\n       pt.code AS matched_to_trait_code,\n       pt.blended_style_name AS matched_to_style,\n       (SELECT count(DISTINCT t.id) FROM career_role_tools t\n         WHERE t.career_role_id = cr.id AND t.is_active AND t.is_deleted IS NOT TRUE) AS tools_listed\n  FROM prof\n  JOIN career_roles cr\n    ON cr.trait_id = prof.dominant_trait_id\n   AND cr.department_degree_id = prof.department_degree_id\n  JOIN personality_traits pt ON pt.id = cr.trait_id\n WHERE cr.is_active AND cr.is_deleted IS NOT TRUE\n ORDER BY cr.id"
+    },
+    {
+      "name": "career_role_guidance",
+      "category": "career",
+      "kind": "read",
+      "description": "The full written guidance for one career role: its overview, the natural strengths it draws on, the learning roadmap broken into foundation, action steps, advancement and career entry, plus detailed guidelines on mindset, habits, weekly time commitment and relevant events. One row per section item. Takes a career_role_id from candidate_career_matches or my_career_matches. This is reference material about the role, not about any person.",
+      "whenToUse": [
+        "how do I become a <role>",
+        "what is the roadmap for this career",
+        "tell me more about this career role",
+        "what should I study for <role>"
+      ],
+      "whenNotToUse": [
+        "Not for which roles match a candidate — that is candidate_career_matches or my_career_matches.",
+        "Not for the software and tools list — that is career_role_tools."
+      ],
+      "parameters": {
+        "career_role_id": {
+          "type": "integer",
+          "description": "The career role id, as returned by candidate_career_matches or my_career_matches.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT",
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [],
+      "sqlTemplate": "SELECT DISTINCT ON (sec.ord, item.ord)\n       cr.career_role_name AS career_role,\n       sec.value->>'title' AS section,\n       item.subtitle,\n       item.content\n  FROM career_roles cr\n  JOIN career_role_guidance_sections g\n    ON g.career_role_id = cr.id AND g.is_active AND g.is_deleted IS NOT TRUE\n  CROSS JOIN LATERAL jsonb_array_elements(coalesce(g.section_content, '[]'::jsonb))\n       WITH ORDINALITY AS sec(value, ord)\n  CROSS JOIN LATERAL (\n       SELECT e.ord,\n              e.val->>'subtitle' AS subtitle,\n              coalesce(\n                e.val->>'text',\n                (SELECT string_agg(b.value #>> '{}', E'\\n')\n                   FROM jsonb_array_elements(coalesce(e.val->'bullets', '[]'::jsonb)) AS b(value)),\n                e.val #>> '{}'\n              ) AS content\n         FROM jsonb_array_elements(\n                CASE WHEN jsonb_typeof(sec.value->'content') = 'array'\n                     THEN sec.value->'content'\n                     ELSE jsonb_build_array(sec.value->'content') END\n              ) WITH ORDINALITY AS e(val, ord)\n  ) item\n WHERE cr.id = {{param:career_role_id}}\n   AND cr.is_active AND cr.is_deleted IS NOT TRUE\n ORDER BY sec.ord, item.ord"
+    },
+    {
+      "name": "career_role_tools",
+      "category": "career",
+      "kind": "read",
+      "description": "The software, platforms and tools recommended for one career role, one per row. Takes a career_role_id from candidate_career_matches or my_career_matches. Reference material about the role, not about any person.",
+      "whenToUse": [
+        "what tools should I learn for this role",
+        "what software does a <role> use"
+      ],
+      "whenNotToUse": [
+        "Not for the learning roadmap — that is career_role_guidance.",
+        "Not for which roles match a candidate — that is candidate_career_matches or my_career_matches."
+      ],
+      "parameters": {
+        "career_role_id": {
+          "type": "integer",
+          "description": "The career role id, as returned by candidate_career_matches or my_career_matches.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT",
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [],
+      "sqlTemplate": "SELECT DISTINCT ON (t.id)\n       cr.career_role_name AS career_role,\n       t.tool_name\n  FROM career_role_tools t\n  JOIN career_roles cr ON cr.id = t.career_role_id\n WHERE t.career_role_id = {{param:career_role_id}}\n   AND t.is_active AND t.is_deleted IS NOT TRUE\n ORDER BY t.id"
+    },
+    {
+      "name": "candidate_course_matches",
+      "category": "career",
+      "kind": "read",
+      "description": "The courses matched to a school candidate's blended behavioural style, with a compatibility percentage, the stream and department each sits under, and a note on why the style fits. For school candidates, who choose a course rather than a job. Takes a registration id from find_candidate. Only returns candidates in your own company.",
+      "whenToUse": [
+        "what course should this school student take",
+        "which stream suits <candidate>",
+        "what should this student study after school"
+      ],
+      "whenNotToUse": [
+        "Not for college or employee candidates — that is candidate_career_matches.",
+        "Not for the scores behind the match — that is candidate_career_profile."
+      ],
+      "parameters": {
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id, as returned by find_candidate.",
+          "required": true,
+          "resolvedIdentifier": true
+        },
+        "stream": {
+          "type": "string",
+          "description": "Optional. Narrow to one school stream, for example \"Physics, Chemistry, Mathematics\". Leave unset for every match.",
+          "required": false,
+          "maxLength": 120
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH prof AS (\n  SELECT DISTINCT ON (r.id) r.id AS registration_id, ar.dominant_trait_id\n    FROM registrations r\n    JOIN assessment_sessions s ON s.registration_id = r.id\n    JOIN LATERAL (\n         SELECT x.dominant_trait_id FROM assessment_reports x\n          WHERE x.assessment_session_id = s.id\n          ORDER BY x.generated_at DESC NULLS LAST, x.id DESC LIMIT 1) ar ON TRUE\n   WHERE r.is_deleted IS NOT TRUE\n     AND r.id = {{param:registration_id}}\n     AND {{scope:corporate_account_id}}\n   ORDER BY r.id, s.id DESC\n)\nSELECT DISTINCT ON (tc.id)\n       tc.course_name,\n       tc.compatibility_percentage AS compatibility_percent,\n       tc.notes AS why_it_fits,\n       ss.name AS stream,\n       ssd.name AS stream_department,\n       pt.code AS matched_to_trait_code,\n       pt.blended_style_name AS matched_to_style\n  FROM prof\n  JOIN trait_based_course_details tc ON tc.trait_id = prof.dominant_trait_id\n  JOIN personality_traits pt ON pt.id = tc.trait_id\n  LEFT JOIN school_stream_departments ssd ON ssd.id = tc.school_stream_department_id\n  LEFT JOIN school_streams ss ON ss.id = ssd.school_stream_id\n WHERE tc.is_active AND tc.is_deleted IS NOT TRUE\n   AND (cast({{param:stream}} AS text) IS NULL OR ss.name ILIKE '%' || {{param:stream}} || '%')\n ORDER BY tc.id"
+    },
+    {
+      "name": "my_career_profile",
+      "category": "student",
+      "kind": "read",
+      "description": "For the signed-in student: everything behind their own career direction — their behavioural (DISC) breakdown and total, their agile values and band, their blended style with what it means, their sincerity, and how many matched career roles exist for them. Call this before offering any career guidance, then my_career_matches for the roles. Returns only the caller's own record.",
+      "whenToUse": [
+        "what career suits me",
+        "what should I do after my degree",
+        "give me career advice",
+        "what do my scores say about my career"
+      ],
+      "whenNotToUse": [
+        "Not for the matched role list — that is my_career_matches.",
+        "Not for the level 1 breakdown alone — that is my_behavioural_profile."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "single",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "r.user_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (r.id)\n       r.full_name AS candidate,\n       coalesce(pr.name, 'unassigned') AS program,\n       pt.code AS trait_code,\n       pt.blended_style_name AS style,\n       pt.blended_style_desc AS what_the_style_means,\n       (ar.disc_scores->>'D')::numeric AS dominance,\n       (ar.disc_scores->>'I')::numeric AS influence,\n       (ar.disc_scores->>'S')::numeric AS steadiness,\n       (ar.disc_scores->>'C')::numeric AS compliance,\n       (ar.disc_scores->>'total')::numeric AS behavioural_total,\n       (ar.agile_scores->>'Commitment')::numeric AS commitment,\n       (ar.agile_scores->>'Focus')::numeric AS focus,\n       (ar.agile_scores->>'Openness')::numeric AS openness,\n       (ar.agile_scores->>'Respect')::numeric AS respect,\n       (ar.agile_scores->>'Courage')::numeric AS courage,\n       (ar.agile_scores->>'total')::numeric AS agile_total,\n       coalesce(b.level_name, 'not banded') AS agile_band,\n       b.interpretation AS what_the_band_means,\n       ar.overall_sincerity AS sincerity,\n       r.department_degree_id,\n       r.school_level,\n       (SELECT count(DISTINCT cr.id) FROM career_roles cr\n         WHERE cr.trait_id = ar.dominant_trait_id\n           AND cr.department_degree_id = r.department_degree_id\n           AND cr.is_active AND cr.is_deleted IS NOT TRUE) AS career_matches_available,\n       ar.generated_at AS report_generated_at\n  FROM registrations r\n  JOIN assessment_sessions s ON s.registration_id = r.id\n  JOIN LATERAL (\n       SELECT x.disc_scores, x.agile_scores, x.dominant_trait_id,\n              x.overall_sincerity, x.generated_at\n         FROM assessment_reports x WHERE x.assessment_session_id = s.id\n        ORDER BY x.generated_at DESC NULLS LAST, x.id DESC LIMIT 1) ar ON TRUE\n  LEFT JOIN programs pr ON pr.id = coalesce(s.program_id, r.program_id)\n  LEFT JOIN personality_traits pt ON pt.id = ar.dominant_trait_id\n  LEFT JOIN LATERAL (\n       SELECT x.level_name, x.interpretation FROM aci_score_bands x\n        WHERE x.is_active AND x.is_deleted IS NOT TRUE\n          AND (ar.agile_scores->>'total')::numeric BETWEEN x.min_score AND x.max_score\n        ORDER BY x.display_order, x.id LIMIT 1) b ON TRUE\n WHERE r.is_deleted IS NOT TRUE\n   AND {{scope:user_id}}\n ORDER BY r.id, s.id DESC"
+    },
+    {
+      "name": "my_career_matches",
+      "category": "student",
+      "kind": "read",
+      "description": "For the signed-in student: the career roles matched to their own blended behavioural style and degree — the role name, what it is, and how many recommended tools are listed. Each row carries a career_role_id that career_role_guidance and career_role_tools take. Returns only the caller's own matches.",
+      "whenToUse": [
+        "which careers match me",
+        "what roles suit my profile",
+        "show me my career options"
+      ],
+      "whenNotToUse": [
+        "Not for the scores behind the match — that is my_career_profile.",
+        "Not for the roadmap of one role — that is career_role_guidance.",
+        "A school student with no degree gets nothing here; use my_course_matches."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "r.user_id"
+        }
+      ],
+      "sqlTemplate": "WITH prof AS (\n  SELECT DISTINCT ON (r.id)\n         r.id AS registration_id, r.department_degree_id, ar.dominant_trait_id\n    FROM registrations r\n    JOIN assessment_sessions s ON s.registration_id = r.id\n    JOIN LATERAL (\n         SELECT x.dominant_trait_id FROM assessment_reports x\n          WHERE x.assessment_session_id = s.id\n          ORDER BY x.generated_at DESC NULLS LAST, x.id DESC LIMIT 1) ar ON TRUE\n   WHERE r.is_deleted IS NOT TRUE\n     AND {{scope:user_id}}\n   ORDER BY r.id, s.id DESC\n)\nSELECT DISTINCT ON (cr.id)\n       cr.id AS career_role_id,\n       cr.career_role_name AS career_role,\n       cr.short_description AS what_the_role_is,\n       pt.code AS matched_to_trait_code,\n       pt.blended_style_name AS matched_to_style,\n       (SELECT count(DISTINCT t.id) FROM career_role_tools t\n         WHERE t.career_role_id = cr.id AND t.is_active AND t.is_deleted IS NOT TRUE) AS tools_listed\n  FROM prof\n  JOIN career_roles cr\n    ON cr.trait_id = prof.dominant_trait_id\n   AND cr.department_degree_id = prof.department_degree_id\n  JOIN personality_traits pt ON pt.id = cr.trait_id\n WHERE cr.is_active AND cr.is_deleted IS NOT TRUE\n ORDER BY cr.id"
+    },
+    {
+      "name": "my_course_matches",
+      "category": "student",
+      "kind": "read",
+      "description": "For the signed-in school student: the courses matched to their own blended behavioural style, with a compatibility percentage, the stream and department each sits under, and a note on why the style fits. Returns only the caller's own matches.",
+      "whenToUse": [
+        "what course should I take",
+        "which stream suits me",
+        "what should I study after school"
+      ],
+      "whenNotToUse": [
+        "Not for a college or employee candidate — that is my_career_matches.",
+        "Not for the scores behind the match — that is my_career_profile."
+      ],
+      "parameters": {
+        "stream": {
+          "type": "string",
+          "description": "Optional. Narrow to one school stream, for example \"Physics, Chemistry, Mathematics\". Leave unset for every match.",
+          "required": false,
+          "maxLength": 120
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "r.user_id"
+        }
+      ],
+      "sqlTemplate": "WITH prof AS (\n  SELECT DISTINCT ON (r.id) r.id AS registration_id, ar.dominant_trait_id\n    FROM registrations r\n    JOIN assessment_sessions s ON s.registration_id = r.id\n    JOIN LATERAL (\n         SELECT x.dominant_trait_id FROM assessment_reports x\n          WHERE x.assessment_session_id = s.id\n          ORDER BY x.generated_at DESC NULLS LAST, x.id DESC LIMIT 1) ar ON TRUE\n   WHERE r.is_deleted IS NOT TRUE\n     AND {{scope:user_id}}\n   ORDER BY r.id, s.id DESC\n)\nSELECT DISTINCT ON (tc.id)\n       tc.course_name,\n       tc.compatibility_percentage AS compatibility_percent,\n       tc.notes AS why_it_fits,\n       ss.name AS stream,\n       ssd.name AS stream_department,\n       pt.code AS matched_to_trait_code,\n       pt.blended_style_name AS matched_to_style\n  FROM prof\n  JOIN trait_based_course_details tc ON tc.trait_id = prof.dominant_trait_id\n  JOIN personality_traits pt ON pt.id = tc.trait_id\n  LEFT JOIN school_stream_departments ssd ON ssd.id = tc.school_stream_department_id\n  LEFT JOIN school_streams ss ON ss.id = ssd.school_stream_id\n WHERE tc.is_active AND tc.is_deleted IS NOT TRUE\n   AND (cast({{param:stream}} AS text) IS NULL OR ss.name ILIKE '%' || {{param:stream}} || '%')\n ORDER BY tc.id"
+    },
+    {
+      "name": "generate_group_reports",
+      "category": "corporate",
+      "kind": "write",
+      "description": "Produce the assessment reports for an entire group as a single downloadable archive, and hand back the link. Takes a group id from find_group — look the cohort up by name first. A whole cohort takes noticeably longer than one candidate. Only groups in your own company can be generated for.",
+      "whenToUse": [
+        "generate the reports for the KIOT CSE group",
+        "download every report for this cohort",
+        "get me the reports for the whole batch"
+      ],
+      "whenNotToUse": [
+        "Not for one candidate — that is generate_candidate_report.",
+        "Not for the placement handbook — that is generate_placement_handbook.",
+        "Look the group up by name first; this takes the id that lookup returns."
+      ],
+      "parameters": {
+        "group_id": {
+          "type": "integer",
+          "description": "The group id, as returned by find_group. Never guess this — look the group up by name first.",
+          "required": true,
+          "resolvedIdentifier": true
+        },
+        "report_type": {
+          "type": "string",
+          "description": "Which report variant to produce for each member. Leave unset for the standard full report.",
+          "required": false,
+          "enum": [
+            "full",
+            "short",
+            "level1"
+          ],
+          "default": "full"
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "confirmation",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "g.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": null,
+      "writeScope": "reports.generate",
+      "requiresConfirmation": false,
+      "httpRequest": {
+        "service": "reports",
+        "method": "GET",
+        "path": "/report/generate/group/{{param:group_id}}?json=true&reportType={{param:report_type}}",
+        "precondition": {
+          "sqlTemplate": "SELECT 1 FROM groups g WHERE g.id = {{param:group_id}} AND g.is_deleted IS NOT TRUE AND {{scope:corporate_account_id}}",
+          "denyMessage": "That group is not in your account."
+        },
+        "poll": {
+          "urlFrom": "statusUrl",
+          "statusField": "status",
+          "successWhen": [
+            "COMPLETED"
+          ],
+          "failureWhen": [
+            "ERROR"
+          ],
+          "intervalMs": 2000,
+          "maxAttempts": 30
+        },
+        "result": {
+          "link": {
+            "from": "downloadUrl",
+            "label": "Download the report"
+          },
+          "expose": [
+            {
+              "from": "password",
+              "label": "Report password"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "generate_placement_handbook",
+      "category": "corporate",
+      "kind": "write",
+      "description": "Produce a single consolidated placement document for one group and one department-degree, and hand back the download link. This is one PDF about the whole cohort, not one per person. Three kinds: \"standard\" is the DISC placement handbook, \"mba\" is the specialization-based MBA handbook which needs level 1 only, and \"level1\" is the trait-mapping report built from raw level 1 scores. Leave the kind unset and the host picks the MBA handbook when the department, group or report title says MBA. Takes ids from find_group and find_department_degree.",
+      "whenToUse": [
+        "generate the placement handbook for KIOT CSE",
+        "make the MBA placement report for this batch",
+        "I need the level 1 placement report",
+        "produce the placement book for this department"
+      ],
+      "whenNotToUse": [
+        "Not for one PDF per person — that is generate_group_reports.",
+        "Not for a single candidate — that is generate_candidate_report.",
+        "Check group_report_readiness first: it gives the department_degree_id and says whether anyone has finished."
+      ],
+      "parameters": {
+        "group_id": {
+          "type": "integer",
+          "description": "The group id, as returned by find_group. Never guess this.",
+          "required": true,
+          "resolvedIdentifier": true
+        },
+        "department_degree_id": {
+          "type": "integer",
+          "description": "The department-degree id, from find_department_degree or group_report_readiness. Never guess this.",
+          "required": true,
+          "resolvedIdentifier": true
+        },
+        "report_type": {
+          "type": "string",
+          "description": "Which handbook. \"standard\" forces the DISC placement handbook even for an MBA department. \"mba\" is the specialization handbook and reads level 1 only. \"level1\" is the raw trait-mapping report and works for a cohort that has only finished level 1. Leave unset to let the host auto-detect MBA.",
+          "required": false,
+          "enum": [
+            "standard",
+            "mba",
+            "level1"
+          ]
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "confirmation",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "g.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": null,
+      "writeScope": "reports.generate",
+      "requiresConfirmation": false,
+      "httpRequest": {
+        "service": "reports",
+        "method": "GET",
+        "path": "/report/generate/placement/{{param:group_id}}/{{param:department_degree_id}}?json=true&reportType={{param:report_type}}",
+        "precondition": {
+          "sqlTemplate": "SELECT 1 FROM groups g WHERE g.id = {{param:group_id}} AND g.is_deleted IS NOT TRUE AND {{scope:corporate_account_id}}",
+          "denyMessage": "That group is not in your account."
+        },
+        "poll": {
+          "urlFrom": "statusUrl",
+          "statusField": "status",
+          "successWhen": [
+            "COMPLETED"
+          ],
+          "failureWhen": [
+            "ERROR"
+          ],
+          "intervalMs": 2000,
+          "maxAttempts": 30
+        },
+        "result": {
+          "link": {
+            "from": "downloadUrl",
+            "label": "Download the report"
+          },
+          "expose": [
+            {
+              "from": "password",
+              "label": "Report password"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

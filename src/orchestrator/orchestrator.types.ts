@@ -67,6 +67,10 @@ export type AgentResponseType =
   | 'answer'
   | 'clarification'
   | 'confirmation'
+  // The response policy refused the question before anything ran. Distinct from
+  // 'error' because nothing failed, and distinct from 'answer' because no
+  // function was called — a run that is neither should not be counted as one.
+  | 'refused'
   | 'error';
 
 export interface AgentResponse {

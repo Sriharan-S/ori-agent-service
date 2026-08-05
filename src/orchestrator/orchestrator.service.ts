@@ -8,6 +8,7 @@ import {
   type PendingDisambiguation,
 } from '../memory/conversation.service';
 import { RegistryService } from '../registry/registry.service';
+import { ResponsePolicyService } from '../policy/response-policy.service';
 import { formatGrounding } from '../knowledge/knowledge-prompt';
 import {
   RetrievalService,
@@ -56,6 +57,7 @@ export class OrchestratorService {
     private readonly reflector: ReflectorService,
     private readonly synthesizer: SynthesizerService,
     private readonly retrieval: RetrievalService,
+    private readonly policy: ResponsePolicyService,
     private readonly audit: AuditLoggerService,
   ) {}
 
@@ -135,6 +137,31 @@ export class OrchestratorService {
     this.logger.log(
       `[${context.runId}] intent=${decision.intent} app=${context.application.slug} role=${context.endUser.role}`,
     );
+
+    // The response policy, before anything expensive.
+    //
+    // Routing above is local pattern-matching and costs nothing, so checking
+    // here keeps the recorded intent accurate while still spending no model
+    // tokens and reaching no function. A refused message never leaves the
+    // process: not to a provider, not to the database, not to a registered
+    // service.
+    const verdict = await this.policy.evaluate(
+      context.application.id,
+      message,
+    );
+
+    if (!verdict.allowed) {
+      const refusal = await this.refuse(
+        context,
+        conversationKey,
+        decision.intent,
+        verdict,
+        userMessageId,
+        startedAt,
+        emit,
+      );
+      return refusal;
+    }
 
     try {
       // `runTimeoutMs` was documented as the upper bound on a run and enforced
@@ -604,6 +631,84 @@ export class OrchestratorService {
           `Could not open run record: ${error instanceof Error ? error.message : String(error)}`,
         );
       });
+  }
+
+  /**
+   * Answer a policy refusal.
+   *
+   * Written as a normal turn rather than an error: the user asked something the
+   * operator has decided this assistant does not cover, which is a fact about
+   * the deployment and not a fault. Recording it as an assistant turn also
+   * means a follow-up question reads in context — "why not?" has something to
+   * refer to.
+   *
+   * The matched text goes to the audit log and nowhere near the reply. Telling
+   * someone which word tripped a rule is a map of how to phrase their way past
+   * it.
+   */
+  private async refuse(
+    context: RequestContext,
+    conversationKey: string,
+    intent: string,
+    verdict: { topic?: string; matched?: string; message?: string },
+    userMessageId: number | null,
+    startedAt: number,
+    emit: AgentEventSink,
+  ): Promise<AgentResponse> {
+    const policy = await this.policy.get(context.application.id);
+    const message = verdict.message?.trim() || policy.refusalMessage;
+
+    this.audit.recordRejection(
+      context,
+      `response policy: "${verdict.topic ?? 'unnamed rule'}" matched ${JSON.stringify(verdict.matched ?? '')}`,
+    );
+
+    this.logger.log(
+      `[${context.runId}] refused by policy rule "${verdict.topic ?? 'unnamed'}"`,
+    );
+
+    emit({ type: 'message.delta', channel: 'user', text: message });
+
+    const assistantMessageId = await this.conversations.appendTurn(
+      conversationKey,
+      'assistant',
+      message,
+      { type: 'refused', functionsUsed: [] },
+    );
+
+    if (assistantMessageId !== null) {
+      emit({
+        type: 'turn.recorded',
+        channel: 'user',
+        role: 'assistant',
+        messageId: assistantMessageId,
+      });
+    }
+
+    const response: AgentResponse = {
+      conversationId: conversationKey,
+      runId: context.runId,
+      type: 'refused',
+      message,
+      functionsUsed: [],
+      requestId: context.requestId,
+      userMessageId,
+      assistantMessageId,
+    };
+
+    const latencyMs = Date.now() - startedAt;
+    await this.closeRun(context, intent, response, latencyMs, null);
+
+    emit({
+      type: 'run.completed',
+      channel: 'user',
+      responseType: 'refused',
+      message,
+      functionsUsed: [],
+      latencyMs,
+    });
+
+    return response;
   }
 
   private async closeRun(

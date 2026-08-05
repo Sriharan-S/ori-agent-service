@@ -1,0 +1,529 @@
+{
+  "bundle": "ori.function-bundle",
+  "version": 1,
+  "exportedAt": "2026-08-05T03:44:16.207Z",
+  "application": {
+    "slug": "originbi",
+    "name": "OriginBI"
+  },
+  "_notes": [
+    "Group and cohort queries, report email delivery, and full candidate detail.",
+    "generate_placement_handbook replaces the version in the reports-and-career bundle: same name, better description now that the three handbook variants in reportQueueService.ts are understood. Re-importing it is the point.",
+    "Bulk reports are two different shapes and the catalogue function says so: generate_group_reports produces a ZIP of one PDF per person; generate_placement_handbook produces ONE consolidated PDF about the cohort. Conflating them is the mistake to avoid.",
+    "The MBA handbook and the level 1 placement report read level 1 only, on their own cohort fetches. They run for a batch that has finished the behavioural level and nothing else — the standard handbook will not.",
+    "POST /report/generate/users (an arbitrary hand-picked set, zipped) is NOT wired up: it takes an array of user ids and the function contract has no array parameter type. bulk_report_catalogue says so rather than pretending otherwise.",
+    "email_sent_to is very often the empty string rather than NULL — 685 of 743 reports. Every email function trims and nullifs it, so \"\" is reported as \"not emailed\" rather than as an address.",
+    "Group functions that return candidates scope on registrations.corporate_account_id; those that return groups or windows scope on the group or group_assessment row. A group with no corporate_account_id is invisible to CORPORATE and visible to ADMIN, which is correct.",
+    "group_assessments is double-seeded like everything else. DISTINCT ON (ga.id) plus LATERAL ... LIMIT 1 on every reference join.",
+    "Roles after import: STUDENT gains my_full_profile and my_report_email_status. CORPORATE gains the rest. ADMIN already holds \"*\"."
+  ],
+  "functions": [
+    {
+      "name": "group_assessment_windows",
+      "category": "corporate",
+      "kind": "read",
+      "description": "The assessment windows scheduled for a group: which program each one runs, how many seats it was set up with, how many people are actually registered, whether it is upcoming, running, completed or expired, and the dates it opens and closes. Leave the group unset to see every window. A group can have more than one window over time.",
+      "whenToUse": [
+        "when does the assessment for this group open",
+        "has the window for KIOT CSE closed",
+        "how many seats were booked for this cohort",
+        "which assessment windows are running now"
+      ],
+      "whenNotToUse": [
+        "Not for how far the cohort has got — that is group_progress.",
+        "Not for one person's deadline — that is attempts_expiring_soon or candidate_report_status."
+      ],
+      "parameters": {
+        "group_id": {
+          "type": "integer",
+          "description": "Restrict to one group, as returned by find_group. Leave unset for every window.",
+          "required": false,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "ga.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (ga.id)\n       ga.id AS group_assessment_id,\n       ga.group_id,\n       g.name AS group_name,\n       coalesce(p.name, 'unassigned') AS program,\n       ga.status,\n       ga.total_candidates AS seats,\n       (SELECT count(DISTINCT r.id) FROM registrations r\n         WHERE r.group_id = ga.group_id AND r.is_deleted IS NOT TRUE) AS registered,\n       ga.valid_from AS opens,\n       ga.valid_to AS closes,\n       ca.company_name\n  FROM group_assessments ga\n  LEFT JOIN LATERAL (SELECT x.name FROM groups x WHERE x.id = ga.group_id LIMIT 1) g ON TRUE\n  LEFT JOIN LATERAL (SELECT x.name FROM programs x WHERE x.id = ga.program_id LIMIT 1) p ON TRUE\n  LEFT JOIN LATERAL (SELECT x.company_name FROM corporate_accounts x\n                      WHERE x.id = ga.corporate_account_id LIMIT 1) ca ON TRUE\n WHERE (cast({{param:group_id}} AS integer) IS NULL OR ga.group_id = {{param:group_id}})\n   AND {{scope:corporate_account_id}}\n ORDER BY ga.id DESC"
+    },
+    {
+      "name": "group_progress",
+      "category": "corporate",
+      "kind": "read",
+      "description": "How far a cohort has got, level by level: how many of the group finished each assessment level, how many started it and did not finish, and how many never started. Takes a group id from find_group. The operational answer to \"where is this batch\".",
+      "whenToUse": [
+        "how far has the KIOT CSE group got",
+        "how many of this cohort finished level 2",
+        "who still has not started the assessment",
+        "progress for this batch"
+      ],
+      "whenNotToUse": [
+        "Not for the whole tenant — that is level_completion_funnel.",
+        "Not for one person — that is candidate_level_scores.",
+        "Not for whether reports exist — that is group_report_readiness."
+      ],
+      "parameters": {
+        "group_id": {
+          "type": "integer",
+          "description": "The group id, as returned by find_group. Look the cohort up by name first.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH mem AS (\n  SELECT DISTINCT ON (r.id)\n         r.id AS registration_id, r.user_id, r.full_name,\n         r.department_degree_id, s.id AS session_id, s.status\n    FROM registrations r\n    LEFT JOIN assessment_sessions s ON s.registration_id = r.id\n   WHERE r.is_deleted IS NOT TRUE\n     AND r.group_id = {{param:group_id}}\n     AND {{scope:corporate_account_id}}\n   ORDER BY r.id, s.created_at DESC NULLS LAST, s.id DESC\n), lvl AS (\n  SELECT DISTINCT ON (id) id, level_number, name, sort_order\n    FROM assessment_levels ORDER BY id\n)\nSELECT lvl.level_number,\n       lvl.name AS level,\n       count(DISTINCT mem.registration_id) AS cohort_size,\n       count(DISTINCT mem.registration_id) FILTER (WHERE a.status = 'COMPLETED') AS completed,\n       count(DISTINCT mem.registration_id) FILTER (WHERE a.status IS NOT NULL AND a.status <> 'COMPLETED') AS started_not_finished,\n       count(DISTINCT mem.registration_id) FILTER (WHERE a.status IS NULL) AS never_started\n  FROM lvl\n  CROSS JOIN mem\n  LEFT JOIN LATERAL (\n       SELECT x.status FROM assessment_attempts x\n        WHERE x.registration_id = mem.registration_id\n          AND x.assessment_level_id = lvl.id\n        ORDER BY x.completed_at DESC NULLS LAST, x.id DESC LIMIT 1) a ON TRUE\n GROUP BY lvl.level_number, lvl.name, lvl.sort_order\n ORDER BY lvl.sort_order"
+    },
+    {
+      "name": "group_candidates",
+      "category": "corporate",
+      "kind": "read",
+      "description": "Everyone registered under one group, with their session status, how many levels they have finished, whether their report exists and whether it has been emailed. Takes a group id from find_group. This is the roster you check before producing reports for a cohort.",
+      "whenToUse": [
+        "who is in the KIOT CSE group",
+        "list the candidates in this cohort",
+        "which people in this batch are done"
+      ],
+      "whenNotToUse": [
+        "Not for the level-by-level totals — that is group_progress.",
+        "Not for every candidate in the account — that is list_candidates."
+      ],
+      "parameters": {
+        "group_id": {
+          "type": "integer",
+          "description": "The group id, as returned by find_group.",
+          "required": true,
+          "resolvedIdentifier": true
+        },
+        "session_status": {
+          "type": "string",
+          "description": "Optional. Narrow to one status, for example COMPLETED or EXPIRED.",
+          "required": false,
+          "maxLength": 40
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH mem AS (\n  SELECT DISTINCT ON (r.id)\n         r.id AS registration_id, r.user_id, r.full_name,\n         r.department_degree_id, s.id AS session_id, s.status\n    FROM registrations r\n    LEFT JOIN assessment_sessions s ON s.registration_id = r.id\n   WHERE r.is_deleted IS NOT TRUE\n     AND r.group_id = {{param:group_id}}\n     AND {{scope:corporate_account_id}}\n   ORDER BY r.id, s.created_at DESC NULLS LAST, s.id DESC\n)\nSELECT mem.registration_id,\n       mem.full_name AS candidate,\n       mem.user_id,\n       coalesce(mem.status, 'NO_SESSION') AS session_status,\n       done.n AS levels_completed,\n       (ar.report_number IS NOT NULL) AS report_ready,\n       ar.report_number,\n       coalesce(ar.email_sent, false) AS report_emailed,\n       pt.code AS trait_code,\n       pt.blended_style_name AS style\n  FROM mem\n  LEFT JOIN LATERAL (\n       SELECT count(DISTINCT x.assessment_level_id) AS n FROM assessment_attempts x\n        WHERE x.registration_id = mem.registration_id AND x.status = 'COMPLETED') done ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.report_number, x.email_sent, x.dominant_trait_id\n         FROM assessment_reports x WHERE x.assessment_session_id = mem.session_id\n        ORDER BY x.generated_at DESC NULLS LAST, x.id DESC LIMIT 1) ar ON TRUE\n  LEFT JOIN personality_traits pt ON pt.id = ar.dominant_trait_id\n WHERE (cast({{param:session_status}} AS text) IS NULL\n        OR coalesce(mem.status, 'NO_SESSION') = {{param:session_status}})\n ORDER BY mem.full_name"
+    },
+    {
+      "name": "group_report_readiness",
+      "category": "corporate",
+      "kind": "read",
+      "description": "What can actually be produced for a cohort, broken down by department and degree: how many candidates sit under each, how many finished, and how many already have a report. Placement handbooks are produced per group AND per department-degree, so this is what tells you which handbooks are worth running and gives you the department_degree_id for each. Takes a group id from find_group.",
+      "whenToUse": [
+        "can I run the placement handbook for this group",
+        "which departments are in this cohort",
+        "how many in this batch have reports ready",
+        "is this group ready for bulk report generation"
+      ],
+      "whenNotToUse": [
+        "Not for level-by-level progress — that is group_progress.",
+        "Not for the roster — that is group_candidates."
+      ],
+      "parameters": {
+        "group_id": {
+          "type": "integer",
+          "description": "The group id, as returned by find_group.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH mem AS (\n  SELECT DISTINCT ON (r.id)\n         r.id AS registration_id, r.user_id, r.full_name,\n         r.department_degree_id, s.id AS session_id, s.status\n    FROM registrations r\n    LEFT JOIN assessment_sessions s ON s.registration_id = r.id\n   WHERE r.is_deleted IS NOT TRUE\n     AND r.group_id = {{param:group_id}}\n     AND {{scope:corporate_account_id}}\n   ORDER BY r.id, s.created_at DESC NULLS LAST, s.id DESC\n)\nSELECT coalesce(nullif(concat_ws(' ', dt.name, d.name), ''), 'no degree recorded') AS department_degree,\n       mem.department_degree_id,\n       count(*) AS candidates,\n       count(*) FILTER (WHERE mem.status = 'COMPLETED') AS completed,\n       count(*) FILTER (WHERE EXISTS (\n         SELECT 1 FROM assessment_reports ar\n          WHERE ar.assessment_session_id = mem.session_id)) AS report_ready,\n       count(*) FILTER (WHERE EXISTS (\n         SELECT 1 FROM assessment_attempts a\n          JOIN (SELECT DISTINCT ON (id) id FROM assessment_levels\n                 WHERE level_number = 1 ORDER BY id) l1 ON l1.id = a.assessment_level_id\n          WHERE a.registration_id = mem.registration_id\n            AND a.status = 'COMPLETED')) AS level1_completed\n  FROM mem\n  LEFT JOIN LATERAL (\n       SELECT x.department_id, x.degree_type_id FROM department_degrees x\n        WHERE x.id = mem.department_degree_id LIMIT 1) dd ON TRUE\n  LEFT JOIN LATERAL (SELECT x.name FROM departments x WHERE x.id = dd.department_id LIMIT 1) d ON TRUE\n  LEFT JOIN LATERAL (SELECT x.name FROM degree_types x WHERE x.id = dd.degree_type_id LIMIT 1) dt ON TRUE\n GROUP BY 1, 2\n ORDER BY candidates DESC"
+    },
+    {
+      "name": "group_trait_distribution",
+      "category": "corporate",
+      "kind": "read",
+      "description": "The spread of blended behavioural styles across one cohort: how many of the group came out as each trait code, with the style name and share of the group. Takes a group id from find_group. Useful before a placement conversation, and for seeing whether a batch skews one way.",
+      "whenToUse": [
+        "what is the trait spread for this group",
+        "how many DI students in the KIOT batch",
+        "what styles dominate this cohort"
+      ],
+      "whenNotToUse": [
+        "Not across the whole account — that is trait_code_distribution.",
+        "Not the list of people — that is candidates_by_trait_code or group_candidates."
+      ],
+      "parameters": {
+        "group_id": {
+          "type": "integer",
+          "description": "The group id, as returned by find_group.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH mem AS (\n  SELECT DISTINCT ON (r.id)\n         r.id AS registration_id, r.user_id, r.full_name,\n         r.department_degree_id, s.id AS session_id, s.status\n    FROM registrations r\n    LEFT JOIN assessment_sessions s ON s.registration_id = r.id\n   WHERE r.is_deleted IS NOT TRUE\n     AND r.group_id = {{param:group_id}}\n     AND {{scope:corporate_account_id}}\n   ORDER BY r.id, s.created_at DESC NULLS LAST, s.id DESC\n)\nSELECT pt.code AS trait_code,\n       pt.blended_style_name AS style,\n       count(*) AS candidates,\n       round(100.0 * count(*) / nullif(sum(count(*)) OVER (), 0), 1) AS percent_of_reported\n  FROM mem\n  JOIN LATERAL (\n       SELECT x.dominant_trait_id FROM assessment_reports x\n        WHERE x.assessment_session_id = mem.session_id\n        ORDER BY x.generated_at DESC NULLS LAST, x.id DESC LIMIT 1) ar ON TRUE\n  JOIN personality_traits pt ON pt.id = ar.dominant_trait_id\n GROUP BY pt.code, pt.blended_style_name\n ORDER BY candidates DESC, trait_code"
+    },
+    {
+      "name": "bulk_report_catalogue",
+      "category": "reports",
+      "kind": "read",
+      "description": "The kinds of bulk report this platform produces and what each one actually is: which produce an archive of one PDF per person, which produce a single consolidated document about a whole cohort, what each needs before it will run, and which function generates it. Reference information — it describes the product, not any cohort.",
+      "whenToUse": [
+        "what bulk reports can I generate",
+        "what is the difference between the group reports and the placement handbook",
+        "what is the MBA report",
+        "how do I get reports for a whole batch"
+      ],
+      "whenNotToUse": [
+        "Not for the per-candidate variants — that is report_catalogue.",
+        "Not for whether a given cohort is ready — that is group_report_readiness."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [],
+      "sqlTemplate": "SELECT v.bulk_report, v.produces, v.what_it_is, v.needs, v.generated_by\n  FROM (VALUES\n    (1, 'Group reports',\n        'A ZIP archive, one PDF per person',\n        'Every member of a group gets their own individual report, rendered in whichever variant you ask for, and the lot is zipped together. This is the ordinary \"give me the reports for this batch\" job.',\n        'A group. Members with no generated report are skipped rather than failing the job.',\n        'generate_group_reports'),\n    (2, 'Standard placement handbook',\n        'A single consolidated PDF about the cohort',\n        'The DISC-style placement handbook for one department-degree within a group: the cohort as a whole rather than a stack of individuals. This is what a placement cell hands to recruiters.',\n        'A group and a department-degree, with candidates whose consolidated report row exists — roughly, who finished the assessment.',\n        'generate_placement_handbook, report_type \"standard\"'),\n    (3, 'MBA placement handbook',\n        'A single consolidated PDF about the cohort',\n        'The specialization-based handbook used for MBA cohorts. It reads level 1 only, so it runs for a batch that has finished the behavioural level and nothing else. Chosen automatically when the department, group or report title says MBA.',\n        'A group and a department-degree with level 1 completions. Does NOT need the later levels.',\n        'generate_placement_handbook, report_type \"mba\" (or leave unset to auto-detect)'),\n    (4, 'Level 1 placement report',\n        'A single consolidated PDF about the cohort',\n        'A group-level specialization and trait mapping report built from raw level 1 DISC scores. Different data path from the handbooks above — it does not need a consolidated report row, so it works for a cohort that has only just finished level 1.',\n        'A group and a department-degree with at least one level 1 completion.',\n        'generate_placement_handbook, report_type \"level1\"'),\n    (5, 'Selected candidates',\n        'A ZIP archive, one PDF per person',\n        'The same as group reports but for an arbitrary hand-picked set of people rather than a whole group.',\n        'Not available through this assistant yet — the host supports it, but it takes a list of ids and this assistant can only pass one id at a time. Use a group, or the admin console.',\n        'not available here')\n  ) AS v(sort_order, bulk_report, produces, what_it_is, needs, generated_by)\n ORDER BY v.sort_order"
+    },
+    {
+      "name": "candidate_report_email_status",
+      "category": "corporate",
+      "kind": "read",
+      "description": "Whether one candidate's report was emailed, when, and to which address — and specifically whether that address was their own or somebody else's. Takes a registration id from find_candidate. Only returns candidates in your own company.",
+      "whenToUse": [
+        "was the report sent to this candidate",
+        "which email did the report go to",
+        "did <candidate> receive their report",
+        "was the report sent to the right address"
+      ],
+      "whenNotToUse": [
+        "Not for whether the report exists — that is candidate_report_status.",
+        "Not across the whole account — that is report_email_summary."
+      ],
+      "parameters": {
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id, as returned by find_candidate.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (ar.id)\n       r.full_name AS candidate,\n       ar.report_number,\n       u.email AS their_own_email,\n       nullif(trim(ar.email_sent_to), '') AS delivered_to,\n       ar.email_sent AS emailed,\n       ar.email_sent_at AS emailed_at,\n       CASE\n         WHEN NOT ar.email_sent THEN 'Not emailed yet'\n         WHEN nullif(trim(ar.email_sent_to), '') IS NULL\n           THEN 'Marked as sent, but no recipient address was recorded'\n         WHEN lower(trim(ar.email_sent_to)) = lower(trim(coalesce(u.email, '')))\n           THEN 'Sent to their own address'\n         ELSE 'Sent to a different address, not their own'\n       END AS delivery\n  FROM assessment_reports ar\n  JOIN assessment_sessions s ON s.id = ar.assessment_session_id\n  JOIN registrations r ON r.id = s.registration_id\n  LEFT JOIN users u ON u.id = s.user_id\n WHERE r.is_deleted IS NOT TRUE\n   AND r.id = {{param:registration_id}}\n   AND {{scope:corporate_account_id}}\n ORDER BY ar.id DESC"
+    },
+    {
+      "name": "report_email_summary",
+      "category": "corporate",
+      "kind": "read",
+      "description": "Report delivery across your account in one row: how many reports exist, how many were emailed, how many were not, how many went to the candidate's own address and how many went somewhere else. The starting point for \"did everyone get their report\".",
+      "whenToUse": [
+        "how many reports have been emailed",
+        "did the reports go out",
+        "how many people are still waiting for their report"
+      ],
+      "whenNotToUse": [
+        "Not for which specific ones went elsewhere — that is reports_emailed_elsewhere.",
+        "Not for one person — that is candidate_report_email_status."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "single",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH latest AS (\n  SELECT DISTINCT ON (r.id)\n         r.id AS registration_id, ar.email_sent, ar.email_sent_to, u.email AS own_email\n    FROM registrations r\n    JOIN assessment_sessions s ON s.registration_id = r.id\n    JOIN assessment_reports ar ON ar.assessment_session_id = s.id\n    LEFT JOIN users u ON u.id = s.user_id\n   WHERE r.is_deleted IS NOT TRUE\n     AND {{scope:corporate_account_id}}\n   ORDER BY r.id, ar.generated_at DESC NULLS LAST, ar.id DESC\n)\nSELECT count(*) AS reports,\n       count(*) FILTER (WHERE email_sent) AS emailed,\n       count(*) FILTER (WHERE NOT email_sent) AS not_emailed,\n       count(*) FILTER (WHERE email_sent\n         AND lower(trim(coalesce(email_sent_to, ''))) = lower(trim(coalesce(own_email, '')))) AS to_their_own_address,\n       count(*) FILTER (WHERE email_sent\n         AND nullif(trim(email_sent_to), '') IS NOT NULL\n         AND lower(trim(email_sent_to)) <> lower(trim(coalesce(own_email, '')))) AS to_a_different_address\n  FROM latest"
+    },
+    {
+      "name": "reports_emailed_elsewhere",
+      "category": "corporate",
+      "kind": "read",
+      "description": "Reports that were emailed to an address other than the candidate's own, one row each, with both addresses and the date. The audit answer to \"did anyone's report go to the wrong place\". Only covers candidates in your own company.",
+      "whenToUse": [
+        "did any report go to the wrong email",
+        "whose report was sent to someone else",
+        "show me reports not delivered to the candidate"
+      ],
+      "whenNotToUse": [
+        "Not for the totals — that is report_email_summary.",
+        "Not for one named person — that is candidate_report_email_status."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "WITH latest AS (\n  SELECT DISTINCT ON (r.id)\n         r.id AS registration_id, r.full_name, ar.report_number,\n         ar.email_sent, ar.email_sent_to, ar.email_sent_at, u.email AS own_email\n    FROM registrations r\n    JOIN assessment_sessions s ON s.registration_id = r.id\n    JOIN assessment_reports ar ON ar.assessment_session_id = s.id\n    LEFT JOIN users u ON u.id = s.user_id\n   WHERE r.is_deleted IS NOT TRUE\n     AND {{scope:corporate_account_id}}\n   ORDER BY r.id, ar.generated_at DESC NULLS LAST, ar.id DESC\n)\nSELECT registration_id,\n       full_name AS candidate,\n       report_number,\n       own_email AS their_own_email,\n       email_sent_to AS delivered_to,\n       email_sent_at AS emailed_at\n  FROM latest\n WHERE email_sent\n   AND nullif(trim(email_sent_to), '') IS NOT NULL\n   AND lower(trim(email_sent_to)) <> lower(trim(coalesce(own_email, '')))\n ORDER BY email_sent_at DESC NULLS LAST"
+    },
+    {
+      "name": "my_report_email_status",
+      "category": "student",
+      "kind": "read",
+      "description": "For the signed-in student: whether their own report was emailed, when, and to which address — including whether it went to their own address or somewhere else. Returns only the caller's own record.",
+      "whenToUse": [
+        "was my report emailed to me",
+        "which address did my report go to",
+        "I never received my report"
+      ],
+      "whenNotToUse": [
+        "Not for whether the report exists — that is my_report."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "list",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "r.user_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (ar.id)\n       ar.report_number,\n       u.email AS your_email,\n       nullif(trim(ar.email_sent_to), '') AS delivered_to,\n       ar.email_sent AS emailed,\n       ar.email_sent_at AS emailed_at,\n       CASE\n         WHEN NOT ar.email_sent THEN 'Not emailed yet'\n         WHEN nullif(trim(ar.email_sent_to), '') IS NULL\n           THEN 'Marked as sent, but no recipient address was recorded'\n         WHEN lower(trim(ar.email_sent_to)) = lower(trim(coalesce(u.email, '')))\n           THEN 'Sent to your own address'\n         ELSE 'Sent to a different address'\n       END AS delivery\n  FROM assessment_reports ar\n  JOIN assessment_sessions s ON s.id = ar.assessment_session_id\n  JOIN registrations r ON r.id = s.registration_id\n  LEFT JOIN users u ON u.id = s.user_id\n WHERE r.is_deleted IS NOT TRUE\n   AND {{scope:user_id}}\n ORDER BY ar.id DESC"
+    },
+    {
+      "name": "candidate_full_profile",
+      "category": "corporate",
+      "kind": "read",
+      "description": "Everything on file about one candidate in a single row: who they are and how to contact them, which division they are registered under (School, College, Employee or CXO), their registration status and who registered them, their board and school level or their degree, department and course length, their group and company, payment and subscription state, account state and last login, their assessment window and how many levels they have finished, and whether a report exists, has been emailed, and what style it produced. Takes a registration id from find_candidate. Only returns candidates in your own company.",
+      "whenToUse": [
+        "tell me everything about this candidate",
+        "what is <candidate> registered for",
+        "which department is this student in",
+        "what board does this school student follow",
+        "full details for <candidate>",
+        "is this person an employee or a student"
+      ],
+      "whenNotToUse": [
+        "Not for their scores — that is candidate_level_scores or candidate_career_profile.",
+        "Not for a list of people — that is list_candidates or group_candidates."
+      ],
+      "parameters": {
+        "registration_id": {
+          "type": "integer",
+          "description": "The candidate's registration id, as returned by find_candidate. Ask for the person by name first if you do not have it.",
+          "required": true,
+          "resolvedIdentifier": true
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "single",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "r.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (r.id)\n       r.id AS registration_id,\n       r.user_id,\n       r.full_name AS candidate,\n       u.email,\n       nullif(concat_ws(' ', r.country_code, r.mobile_number), '') AS mobile,\n       r.gender,\n       coalesce(pr.name, 'unassigned') AS division,\n       pr.report_title AS report_they_receive,\n       r.status AS registration_status,\n       r.registration_source AS registered_by,\n       r.school_level,\n       r.student_board AS board,\n       r.school_stream AS stream,\n       nullif(concat_ws(' ', dt.name, d.name), '') AS degree_and_department,\n       d.name AS department,\n       dt.name AS degree,\n       dd.course_duration AS course_years,\n       r.department_degree_id,\n       g.id AS group_id,\n       g.name AS group_name,\n       ca.company_name,\n       r.payment_status,\n       r.payment_amount,\n       r.paid_at,\n       sub.plan_type AS subscription_plan,\n       sub.status AS subscription_status,\n       r.has_ai_counsellor,\n       u.is_active AS account_active,\n       u.is_blocked AS account_blocked,\n       u.last_login_at,\n       coalesce(s.status, 'NO_SESSION') AS session_status,\n       s.valid_from AS assessment_opens,\n       s.valid_to AS assessment_closes,\n       s.completed_at AS assessment_completed_at,\n       done.n AS levels_completed,\n       (ar.report_number IS NOT NULL) AS report_ready,\n       ar.report_number,\n       ar.generated_at AS report_generated_at,\n       coalesce(ar.email_sent, false) AS report_emailed,\n       pt.code AS trait_code,\n       pt.blended_style_name AS style,\n       r.created_at AS registered_on\n  FROM registrations r\n  LEFT JOIN users u ON u.id = r.user_id\n  LEFT JOIN LATERAL (\n       SELECT x.id, x.status, x.program_id, x.valid_from, x.valid_to, x.completed_at\n         FROM assessment_sessions x WHERE x.registration_id = r.id\n        ORDER BY x.created_at DESC NULLS LAST, x.id DESC LIMIT 1) s ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.name, x.report_title FROM programs x\n        WHERE x.id = coalesce(s.program_id, r.program_id) LIMIT 1) pr ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.department_id, x.degree_type_id, x.course_duration\n         FROM department_degrees x WHERE x.id = r.department_degree_id LIMIT 1) dd ON TRUE\n  LEFT JOIN LATERAL (SELECT x.name FROM departments x WHERE x.id = dd.department_id LIMIT 1) d ON TRUE\n  LEFT JOIN LATERAL (SELECT x.name FROM degree_types x WHERE x.id = dd.degree_type_id LIMIT 1) dt ON TRUE\n  LEFT JOIN LATERAL (SELECT x.id, x.name FROM groups x WHERE x.id = r.group_id LIMIT 1) g ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.company_name FROM corporate_accounts x\n        WHERE x.id = r.corporate_account_id LIMIT 1) ca ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.plan_type, x.status FROM student_subscriptions x\n        WHERE x.registration_id = r.id\n        ORDER BY x.purchased_at DESC NULLS LAST, x.id DESC LIMIT 1) sub ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT count(DISTINCT x.assessment_level_id) AS n FROM assessment_attempts x\n        WHERE x.registration_id = r.id AND x.status = 'COMPLETED') done ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.report_number, x.generated_at, x.email_sent, x.dominant_trait_id\n         FROM assessment_reports x WHERE x.assessment_session_id = s.id\n        ORDER BY x.generated_at DESC NULLS LAST, x.id DESC LIMIT 1) ar ON TRUE\n  LEFT JOIN personality_traits pt ON pt.id = ar.dominant_trait_id\n WHERE r.is_deleted IS NOT TRUE\n   AND r.id = {{param:registration_id}}\n   AND {{scope:corporate_account_id}}\n ORDER BY r.id"
+    },
+    {
+      "name": "my_full_profile",
+      "category": "student",
+      "kind": "read",
+      "description": "For the signed-in student: their own complete record — contact details, which division they are registered under, registration status, their board and school level or their degree and department, their group, payment and subscription state, their assessment window, how many levels they have finished, and whether their report exists and has been emailed. Returns only the caller's own record.",
+      "whenToUse": [
+        "what am I registered for",
+        "show me my details",
+        "which course am I signed up under",
+        "what is my registration status"
+      ],
+      "whenNotToUse": [
+        "Not for scores — that is my_level_scores or my_career_profile.",
+        "Not only for the assessment state — that is my_assessment_status."
+      ],
+      "parameters": {},
+      "requiredOneOf": [],
+      "returns": "single",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "STUDENT"
+      ],
+      "scopeFilters": [
+        {
+          "key": "user_id",
+          "column": "r.user_id"
+        }
+      ],
+      "sqlTemplate": "SELECT DISTINCT ON (r.id)\n       r.id AS registration_id,\n       r.user_id,\n       r.full_name AS candidate,\n       u.email,\n       nullif(concat_ws(' ', r.country_code, r.mobile_number), '') AS mobile,\n       r.gender,\n       coalesce(pr.name, 'unassigned') AS division,\n       pr.report_title AS report_they_receive,\n       r.status AS registration_status,\n       r.registration_source AS registered_by,\n       r.school_level,\n       r.student_board AS board,\n       r.school_stream AS stream,\n       nullif(concat_ws(' ', dt.name, d.name), '') AS degree_and_department,\n       d.name AS department,\n       dt.name AS degree,\n       dd.course_duration AS course_years,\n       r.department_degree_id,\n       g.id AS group_id,\n       g.name AS group_name,\n       ca.company_name,\n       r.payment_status,\n       r.payment_amount,\n       r.paid_at,\n       sub.plan_type AS subscription_plan,\n       sub.status AS subscription_status,\n       r.has_ai_counsellor,\n       u.is_active AS account_active,\n       u.is_blocked AS account_blocked,\n       u.last_login_at,\n       coalesce(s.status, 'NO_SESSION') AS session_status,\n       s.valid_from AS assessment_opens,\n       s.valid_to AS assessment_closes,\n       s.completed_at AS assessment_completed_at,\n       done.n AS levels_completed,\n       (ar.report_number IS NOT NULL) AS report_ready,\n       ar.report_number,\n       ar.generated_at AS report_generated_at,\n       coalesce(ar.email_sent, false) AS report_emailed,\n       pt.code AS trait_code,\n       pt.blended_style_name AS style,\n       r.created_at AS registered_on\n  FROM registrations r\n  LEFT JOIN users u ON u.id = r.user_id\n  LEFT JOIN LATERAL (\n       SELECT x.id, x.status, x.program_id, x.valid_from, x.valid_to, x.completed_at\n         FROM assessment_sessions x WHERE x.registration_id = r.id\n        ORDER BY x.created_at DESC NULLS LAST, x.id DESC LIMIT 1) s ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.name, x.report_title FROM programs x\n        WHERE x.id = coalesce(s.program_id, r.program_id) LIMIT 1) pr ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.department_id, x.degree_type_id, x.course_duration\n         FROM department_degrees x WHERE x.id = r.department_degree_id LIMIT 1) dd ON TRUE\n  LEFT JOIN LATERAL (SELECT x.name FROM departments x WHERE x.id = dd.department_id LIMIT 1) d ON TRUE\n  LEFT JOIN LATERAL (SELECT x.name FROM degree_types x WHERE x.id = dd.degree_type_id LIMIT 1) dt ON TRUE\n  LEFT JOIN LATERAL (SELECT x.id, x.name FROM groups x WHERE x.id = r.group_id LIMIT 1) g ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.company_name FROM corporate_accounts x\n        WHERE x.id = r.corporate_account_id LIMIT 1) ca ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.plan_type, x.status FROM student_subscriptions x\n        WHERE x.registration_id = r.id\n        ORDER BY x.purchased_at DESC NULLS LAST, x.id DESC LIMIT 1) sub ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT count(DISTINCT x.assessment_level_id) AS n FROM assessment_attempts x\n        WHERE x.registration_id = r.id AND x.status = 'COMPLETED') done ON TRUE\n  LEFT JOIN LATERAL (\n       SELECT x.report_number, x.generated_at, x.email_sent, x.dominant_trait_id\n         FROM assessment_reports x WHERE x.assessment_session_id = s.id\n        ORDER BY x.generated_at DESC NULLS LAST, x.id DESC LIMIT 1) ar ON TRUE\n  LEFT JOIN personality_traits pt ON pt.id = ar.dominant_trait_id\n WHERE r.is_deleted IS NOT TRUE\n   AND {{scope:user_id}}\n ORDER BY r.id"
+    },
+    {
+      "name": "generate_placement_handbook",
+      "category": "corporate",
+      "kind": "write",
+      "description": "Produce a single consolidated placement document for one group and one department-degree, and hand back the download link. This is one PDF about the whole cohort, not one per person. Three kinds: \"standard\" is the DISC placement handbook, \"mba\" is the specialization-based MBA handbook which needs level 1 only, and \"level1\" is the trait-mapping report built from raw level 1 scores. Leave the kind unset and the host picks the MBA handbook when the department, group or report title says MBA. Takes ids from find_group and find_department_degree.",
+      "whenToUse": [
+        "generate the placement handbook for KIOT CSE",
+        "make the MBA placement report for this batch",
+        "I need the level 1 placement report",
+        "produce the placement book for this department"
+      ],
+      "whenNotToUse": [
+        "Not for one PDF per person — that is generate_group_reports.",
+        "Not for a single candidate — that is generate_candidate_report.",
+        "Check group_report_readiness first: it gives the department_degree_id and says whether anyone has finished."
+      ],
+      "parameters": {
+        "group_id": {
+          "type": "integer",
+          "description": "The group id, as returned by find_group. Never guess this.",
+          "required": true,
+          "resolvedIdentifier": true
+        },
+        "department_degree_id": {
+          "type": "integer",
+          "description": "The department-degree id, from find_department_degree or group_report_readiness. Never guess this.",
+          "required": true,
+          "resolvedIdentifier": true
+        },
+        "report_type": {
+          "type": "string",
+          "description": "Which handbook. \"standard\" forces the DISC placement handbook even for an MBA department. \"mba\" is the specialization handbook and reads level 1 only. \"level1\" is the raw trait-mapping report and works for a cohort that has only finished level 1. Leave unset to let the host auto-detect MBA.",
+          "required": false,
+          "enum": [
+            "standard",
+            "mba",
+            "level1"
+          ]
+        }
+      },
+      "requiredOneOf": [],
+      "returns": "confirmation",
+      "ambiguityResolvesTo": null,
+      "allowedRoles": [
+        "CORPORATE",
+        "ADMIN"
+      ],
+      "scopeFilters": [
+        {
+          "key": "corporate_account_id",
+          "column": "g.corporate_account_id"
+        }
+      ],
+      "sqlTemplate": null,
+      "writeScope": "reports.generate",
+      "requiresConfirmation": false,
+      "httpRequest": {
+        "service": "reports",
+        "method": "GET",
+        "path": "/report/generate/placement/{{param:group_id}}/{{param:department_degree_id}}?json=true&reportType={{param:report_type}}",
+        "precondition": {
+          "sqlTemplate": "SELECT 1 FROM groups g WHERE g.id = {{param:group_id}} AND g.is_deleted IS NOT TRUE AND {{scope:corporate_account_id}}",
+          "denyMessage": "That group is not in your account."
+        },
+        "poll": {
+          "urlFrom": "statusUrl",
+          "statusField": "status",
+          "successWhen": [
+            "COMPLETED"
+          ],
+          "failureWhen": [
+            "ERROR"
+          ],
+          "intervalMs": 2000,
+          "maxAttempts": 30
+        },
+        "result": {
+          "link": {
+            "from": "downloadUrl",
+            "label": "Download the report"
+          },
+          "expose": [
+            {
+              "from": "password",
+              "label": "Report password"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
